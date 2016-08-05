@@ -1,0 +1,2281 @@
+#!/usr/bin/python
+
+#    TAMtools v0.0.1 ALPHA
+#
+#    Copyright 2016 Tam Freestone-Bayes 
+#    t.freestone-bayes@maths.cam.ac.uk | tam.freestone-bayes@sanger.ac.uk
+#
+#    This program is free software: you can redistribute it and/or modify
+#    it under the terms of the GNU General Public License as published by
+#    the Free Software Foundation, either version 3 of the License, or
+#    (at your option) any later version.
+#
+#    This program is distributed in the hope that it will be useful,
+#    but WITHOUT ANY WARRANTY; without even the implied warranty of
+#    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#    GNU General Public License for more details.
+#
+#    You should have received a copy of the GNU General Public License
+#    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+import os
+import sys
+import time
+import errno
+import tempfile
+import subprocess
+import logging
+import pysam
+import json
+import re
+import argparse
+import textwrap
+from shutil import copyfile
+from bx.intervals import *
+from bx.intervals.cluster import ClusterTree
+from tabulate import tabulate
+# The following imports are only required if using the HTTP daemon features:
+from BaseHTTPServer import HTTPServer
+from BaseHTTPServer import BaseHTTPRequestHandler
+from urlparse import urlparse, parse_qs
+# The following imports are only required if using the HTTP client features:
+import urllib
+import urllib2
+
+# 
+# Set logging here:
+#
+logging.basicConfig(level=logging.INFO)
+#logging.basicConfig(level=logging.DEBUG) # Uncomment this for DEBUG output
+
+logger = logging.getLogger(__name__)
+
+sam_write_flags = { 'sam' : 'wh', 'bam' : 'wb', 'cram' : 'wc' }
+
+
+def mummer_make_map(blocklength, ref_a, ref_b, output_dir):
+
+
+  def invoke_mummer(blocklength, ref_a, ref_b, mum_filename):
+    command = 'mummer -mum -b -c -n -l {} {} {} > {}'.format(
+      blocklength, ref_a, ref_b, mum_filename
+    )
+    return_code = subprocess.call(command, shell=True)
+    if return_code != 0:
+      print("Could not run shell command: " + command)
+      print("Exit code: " + str(return_code))
+      if return_code == 127:
+        print("Please ensure mummer 64-bit executable is in your $PATH environment variable.")
+        print("e.g.: export PATH=/utils/MUMmer3.23/:$PATH")
+      quit(1)
+
+  def mummer_to_chain(mum_filename, ref_a, ref_b, chain_filename):
+
+    """ 
+    This function will parse a Mummer maximal unique match output file (see
+    http://mummer.sourceforge.net/), and generate a genome coordinate mapping 
+    chain file (see http://genome.ucsc.edu/golden_path/help/chain.html).
+
+    It requires four file names as parameters:
+
+    - Filename of the Mummer MUM output
+    - Filename of Reference Assembly A in FASTA format
+    - Filename of Reference Assembly B in FASTA format
+    - Filename of where the "pseudo chain file" output will be written
+
+    where mummer.mum is created (assuming mummer is installed) as follows:
+
+    mummer -mum -b -c -n -l 1000 hs37d5.fa \
+      GC_a_000001405.15_GRCref2_full_plus_hs38d1_analysis_set.fna > mummer.mum
+
+    Note that the hidden chain file produced is not in quite the right format
+    to be a valid chainfile for use with other programs. This is intended to be
+    corrected in future versions of tamtools.
+    """
+
+    def read_mummer_mums(fp):
+
+      chain_properties = None
+      ref1_contig = None
+      ref2_contig = None
+      strand = None
+      msbs = []
+      
+      # Loop through mummer mum results, and yield each chain and its MSBs:
+
+      for line in fp:
+        
+        line = line.rstrip()
+        fields = line.split()
+
+        if line.startswith(">"):
+          # Mummer results for each new chain in the first assembly begin with ">".
+          # If we encounter such a line, we should we should return the existing 
+          # chain if we have one, and start a new set of MSBs for a new chain:
+          if chain_properties:
+            yield (chain_properties, msbs)
+
+          ref2_contig, msbs = fields[1], []
+          if line.endswith(" Reverse"):
+            strand = "-"
+          else:
+            strand = "+"
+        else:
+
+          mum = fields
+          
+          if (ref1_contig != mum[0]):
+            # Mummer produces, for each chain in the first assembly, a number of
+            # results (for each relevant chain in the second assembly). These are 
+            # identified by a change in the contig name. At this stage, we should 
+            # therefore return the existing chain if we have one, and start a new
+            # set of MSBs:
+            if chain_properties:
+              yield (chain_properties, msbs)         
+              msbs = []
+
+            ref1_contig = mum[0];
+
+          msb = map(int, mum[1:4])
+          msb[0] = msb[0] - 1   # zero-based intervals
+          msb[1] = msb[1] - 1   # zero-based intervals
+
+          # the first mum has some details we need for the chain_header:
+          if msbs == []:
+            chain_properties = {
+              'ref1_contig': ref1_contig,
+              'ref1_strand': '+',
+              'ref1_shared_blocks_start': str(msb[0]),
+              'ref2_contig': ref2_contig,
+              'ref2_strand': strand,
+              'ref2_shared_blocks_start': str(msb[1])
+            }
+
+          # We only want to use this msb if   
+          msbs.append(msb)
+
+      if chain_properties:
+        # We have reached the end of _mummer's output, so we are done. 
+        # Return the final chain and its MSBs (no need to reset the msbs 
+        # variable here, as we have no further use for it):
+        yield (chain_properties, msbs)
+
+
+    def create_chain_header(
+      chain_properties, chain_msbs, chain_id, 
+      ref1_contig_lengths, ref2_contig_lengths):
+
+      def get_alignment_lengths(chain_msbs):
+        final_msb = chain_msbs[len(chain_msbs)-1]
+        return(
+          final_msb[0] + final_msb[2] - chain_msbs[0][0],
+          final_msb[1] + final_msb[2] - chain_msbs[0][1]
+        )
+
+      def get_rc_alignment_details(ref2_contig_length, chain_msbs):
+        final_msb = chain_msbs[len(chain_msbs)-1]
+        return(
+          1 + chain_msbs[0][1] - chain_msbs[0][2],
+          1 + final_msb[1]
+        )
+
+
+      ref1_alignment_length, ref2_alignment_length = get_alignment_lengths(chain_msbs)
+
+      if chain_properties["ref2_strand"] == '-':
+        ref2_a_start, ref2_a_stop = get_rc_alignment_details(ref2_contig_lengths[chain_properties["ref2_contig"]], chain_msbs)
+      else:
+        ref2_a_start = chain_properties["ref2_shared_blocks_start"]
+        ref2_a_stop = int(chain_properties["ref2_shared_blocks_start"]) + ref2_alignment_length
+
+      chain_header = [
+              "chain",
+              "-1", # score not relevant to us, so we will set it to -1
+              chain_properties["ref1_contig"],
+              str(ref1_contig_lengths[chain_properties["ref1_contig"]]),
+              chain_properties["ref1_strand"],
+              chain_properties["ref1_shared_blocks_start"],
+              str(int(chain_properties["ref1_shared_blocks_start"]) + ref1_alignment_length),
+              chain_properties["ref2_contig"],
+              str(ref2_contig_lengths[chain_properties["ref2_contig"]]),
+              chain_properties["ref2_strand"],
+              str(ref2_a_start),
+              str(ref2_a_stop),
+              str(chain_id)
+            ]
+
+      return(" ".join(chain_header))
+
+
+    def generate_chain_file(mum_filename, ref1_fasta, ref2_fasta, chain_filename):
+
+      ref1_contig_lengths = get_contig_lengths(ref1_fasta)
+      ref2_contig_lengths = get_contig_lengths(ref2_fasta)
+      
+      f = open(chain_filename, 'w')
+      f.write("# Chain file generated on: " + time.strftime("%c") + "\n")
+      f.write("# Chain file generated by: " + os.path.abspath(sys.argv[0]) + "\n")
+      f.write("#" + "\n")
+      f.write("# Input files:" + "\n")
+      f.write("#" + "\n")
+      f.write("#  Reference Assembly 1: " + os.path.abspath(ref1_fasta) + "\n")
+      f.write("#  Reference Assembly 2: " + os.path.abspath(ref2_fasta) + "\n")
+      f.write("#     mummer.out file: " + os.path.abspath(mum_filename) + "\n")
+      f.write("#" + "\n")
+      f.write("# Command line used in working directory " + os.getcwd() + ":" + "\n")
+      f.write("# " + ' '.join(sys.argv) + "\n")
+      f.write("\n")
+      
+      with open(mum_filename) as fp:
+        chain_id = 0
+        for chain_properties, chain_msbs in read_mummer_mums(fp):
+          if len(chain_msbs) > 0:
+            # We have a chain with one or more MSBs
+            chain_id += 1
+
+            # Output chain header:
+            f.write(create_chain_header(
+              chain_properties, chain_msbs, chain_id, 
+              ref1_contig_lengths, ref2_contig_lengths
+            ) + "\n")
+
+
+            if (chain_properties["ref2_strand"] == '-'):
+              for index, msb in enumerate(chain_msbs):
+                msb[1] = msb[1] - msb[2]
+                chain_msbs[index] = msb
+
+            # Output the chain's MSBs:
+            chain_alignments = []
+            num_msbs = len(chain_msbs)
+            for index, msb in enumerate(chain_msbs):
+              if (index < num_msbs-1):
+                next_msb = chain_msbs[index + 1];
+
+                if (chain_properties["ref2_strand"] == "+"):
+                  alignment = map(str, [
+                    msb[2],
+                    next_msb[0] - (msb[0] + msb[2]),
+                    next_msb[1] - (msb[1] + msb[2])              
+                  ])
+                else:
+                  alignment = map(str, [
+                    msb[2],
+                    next_msb[0] - (msb[0] + msb[2]),
+                    next_msb[1] - (msb[1] + msb[2])              
+                  ])
+                  
+                f.write("\t".join(alignment) + "\n")
+              else:
+                alignment = str(msb[2])
+                f.write(alignment + "\n")
+                f.write("\n")
+              
+    generate_chain_file(mum_filename, ref_a, ref_b, chain_filename)
+
+
+  def create_hybrid_fasta(chain_filename, blocklength, ref1, ref2, hybrid_fasta, map_filename):
+
+    # Process chain file to produce maps in both directions
+
+    # This is not particularly efficient; it reads both reference FASTA files into memory,
+    # creates various hashtables and objects, and uses LOTS of memory for human refs.
+    # But it is reasonably fast once these are read...
+
+    def process_chain_filename(chain_filename, blocklength): 
+
+      assembly_1_overlapped_msbs = {}
+      assembly_1_individual_msbs = {}
+
+      assembly_2_overlapped_msbs = {}
+      assembly_2_individual_msbs = {}
+
+      for line in open(chain_filename):
+        line = line.strip()
+        if not line or line.startswith(('#', ' ')): continue
+        fields = line.split()
+        
+        if fields[0] == 'chain' and len(fields) in [12, 13]: 
+
+          assembly_1_contig_name = fields[2]
+          assembly_1_size = int(fields[3])
+          assembly_1_strand = fields[4]
+          assembly_1_start = int(fields[5])
+          assembly_1_end = int(fields[6])
+
+          assembly_2_contig_name = fields[7]
+          assembly_2_size = int(fields[8])
+          assembly_2_strand = fields[9]
+          assembly_2_start = int(fields[10])
+          assembly_2_end = int(fields[11])
+
+          logger.debug("ChainEntry for contigs " + assembly_1_contig_name + " " + assembly_2_contig_name)
+          
+          if assembly_1_strand != '+':
+            raise Exception("Source strand in an .over.chain file must be + . (%s)" % line)
+          if assembly_2_strand not in ['+', '-']:
+            raise Exception("Target strand must be - or + . (%s)" % line)
+
+          if assembly_1_contig_name not in assembly_1_overlapped_msbs:
+            assembly_1_overlapped_msbs[assembly_1_contig_name] = ClusterTree(0, 0)
+            assembly_1_individual_msbs[assembly_1_contig_name] = Intersecter()     
+
+          if assembly_2_contig_name not in assembly_2_overlapped_msbs:
+            assembly_2_overlapped_msbs[assembly_2_contig_name] = ClusterTree(0, 0)
+            assembly_2_individual_msbs[assembly_2_contig_name] = Intersecter()     
+
+          assembly_1_msb_start, assembly_2_msb_start = assembly_1_start, assembly_2_start
+          
+        elif len(fields) == 3 or len(fields) == 1: 
+
+          size = int(fields[0])
+          strand_msb_start = assembly_2_msb_start
+          strand_msb_stop = assembly_2_msb_start + size
+          containers = assembly_1_individual_msbs[assembly_1_contig_name].find(assembly_1_msb_start, assembly_1_msb_start + size)
+          logger.debug("Containers: " + str(len(containers)))
+
+          if (len(containers) >= 0):
+
+            logger.debug("Creating MSB: " + assembly_1_contig_name + ":" + str(assembly_1_msb_start) + "-" + str(assembly_1_msb_start + size) + " <-> " + assembly_2_contig_name + ":" + str(assembly_2_msb_start) + "-" + str(assembly_2_msb_start + size))
+            # Store details of each individual MSB:
+            logger.debug("Assembly1: " + ' # '.join([assembly_1_contig_name, str(assembly_1_msb_start), str(assembly_1_msb_start + size), assembly_2_contig_name, str(strand_msb_start), str(strand_msb_stop), assembly_2_strand]))
+            assembly_1_individual_msbs[assembly_1_contig_name].add_interval(
+              Interval(assembly_1_msb_start, assembly_1_msb_start + size, (assembly_2_contig_name, strand_msb_start, strand_msb_stop, assembly_2_strand))
+            )
+            logger.debug("Assembly2: " + ' # '.join([assembly_2_contig_name, str(assembly_2_msb_start), str(assembly_2_msb_start + size), assembly_1_contig_name, str(strand_msb_start), str(strand_msb_stop), assembly_2_strand]))
+            assembly_2_individual_msbs[assembly_2_contig_name].add_interval(
+              Interval(assembly_2_msb_start, assembly_2_msb_start + size, (assembly_1_contig_name, strand_msb_start, strand_msb_stop, assembly_2_strand))
+            )
+
+            # Store overlapping MSB regions so we can identify the remaining segments as private:
+            assembly_1_overlapped_msbs[assembly_1_contig_name].insert(assembly_1_msb_start, assembly_1_msb_start + size, 0)
+            assembly_2_overlapped_msbs[assembly_2_contig_name].insert(assembly_2_msb_start, assembly_2_msb_start + size, 0)
+
+          else:
+            logger.debug("Not making MSB: " + assembly_1_contig_name + ":" + str(assembly_1_msb_start) + "-" + str(assembly_1_msb_start + size) + " <-> " + assembly_2_contig_name + ":" + str(assembly_2_msb_start) + "-" + str(assembly_2_msb_start + size))
+            for con in containers:
+              fro = stringify_position(assembly_1_contig_name, con.start+1, con.end)
+              logger.debug(" container: " + fro)
+
+          if len(fields) == 3:
+            assembly_1_msb_start += size + int(fields[1])
+            assembly_2_msb_start += size + int(fields[2])
+
+        else:
+          raise Exception("Error in chain file: (%s)" % line)
+
+      if (assembly_1_msb_start + size) != assembly_1_end  or (assembly_2_msb_start + size) != assembly_2_end:
+        msg = str(assembly_2_msb_start) + "+" + str(size) + "=" + str(assembly_2_end)
+        raise Exception("Chain size does not equal sum of alignment block sizes: (%s)" % msg)    
+      
+      return (assembly_1_overlapped_msbs, assembly_1_individual_msbs, assembly_2_overlapped_msbs, assembly_2_individual_msbs) 
+      
+
+    def stringify_position(contig_name, start, end, strand=""):
+      return((contig_name + ":" + str(start+0) + "-" + str(end) + " " + strand).strip())
+
+
+    def get_contigs(filename):
+
+      def extract_contigs(fp):
+        name, seq = None, []
+        for line in fp:
+          line = line.rstrip()
+          if line.startswith(">"):
+            if name: yield (name, ''.join(seq))
+            name, seq = line.split()[0].replace(">", "").strip(), []
+          else:
+            seq.append(line)
+        if name: yield (name, ''.join(seq))
+
+      contigs = {}
+
+      with open(filename) as fp:
+        for name, seq in extract_contigs(fp):
+          contigs[name] = seq
+
+      return(contigs)
+
+    def format_sequence(sequence, lineLength=80):
+      # split a sequence up with newlines. useful for tidy fasta files.
+      return("\n".join([sequence[n:n+lineLength] for n in range(0, len(sequence), lineLength)]))
+
+    def get_sequence(contigs, region_desc):
+      logger.debug("getting sequence from spec: " + region_desc)
+      (contig_name, region_start, region_end) = get_region_details(region_desc)
+      logger.debug("calculated end-start=" + str(region_end-region_start))
+      seq = contigs[contig_name][region_start-1:region_end] # python arrays 0 based
+      return(seq)
+
+    def extract_msb_id(msb_desc):
+      return int(msb_desc.split(':', 1)[0][4:]), ''
+
+
+
+    def create_private_segment(blocklength, contig_name, private_start, private_end, real_private):
+      if (private_start + blocklength > private_end):
+        logger.debug("Private Segment not reqd: " +  str(private_start) + "-" + str(private_end))
+        return None
+      ps = stringify_position(
+        contig_name, 
+        private_start, private_end
+      )
+      logger.debug("Created Private Segment: " + ps)
+      return(ps)
+
+
+    def ps_desc(assembly_id, ps_counter, real_private):
+      return('_'.join(['PRIVATE', assembly_id, str(ps_counter)]) + ":" + str(real_private))
+
+    def get_private_segments(assembly_id, msb_intersecters, contig_lengths):
+
+      ps_counter = 1
+      for contig_name in sorted(msb_intersecters):
+        logger.debug("Generating private segments for: " +assembly_id +":"+ contig_name)
+        private_start = 1
+        contig_msbs = msb_intersecters[contig_name].find(0, contig_lengths[contig_name]+1)
+        logger.debug("This contig has this many MSBs: " + str(len(contig_msbs)))
+
+        # If this contig has no MSBs then the whole thing is a private segment:
+        if (len(contig_msbs)) == 0:
+          logger.info("Fatal: This is supposed to be handled elsewhere.")
+          quit(1)
+          ps = create_private_segment(blocklength, contig_name, 1, contig_lengths[contig_name], contig_lengths[contig_name])
+          yield(contig_lengths[contig_name], ps_desc(assembly_id, ps_counter, contig_lengths[contig_name]), ps)
+          ps_counter += 1
+          continue
+
+        # Otherwise, we have at least one MSB in the current contig:
+        prevMSB = contig_msbs[0]
+
+        # initial PS required?
+        if contig_msbs[0].start > 1:
+          real_private = contig_msbs[0].start - 0
+          ps = create_private_segment(blocklength, contig_name, 1, contig_msbs[0].start + blocklength - 1, real_private)
+          yield (contig_msbs[0].start - 1, ps_desc(assembly_id, ps_counter, real_private), ps)
+          ps_counter += 1
+
+        for idx, msb in enumerate(contig_msbs):
+          logger.debug(contig_name + "\tMSB: " + str(msb.start) + "-" + str(msb.end) + " # " + str(contig_lengths[contig_name]))
+          if idx > 0:
+            nextMSB = msb
+            gap = nextMSB.start - prevMSB.end
+            logger.debug("Index " + str(idx) + ": " + str(nextMSB.start) + "-" + str(prevMSB.end) + "=" + str(gap))
+            if gap > -blocklength:
+              real_private = max(0, gap)
+              ps = create_private_segment(blocklength, contig_name, prevMSB.end - blocklength + 1, nextMSB.start + blocklength - 1, real_private) #0th base so no need to -1
+              if ps is not None:
+                logger.debug("Private Segment Inner:" + ps)
+                yield (gap, ps_desc(assembly_id, ps_counter, real_private), ps)
+                ps_counter += 1
+              else:
+                logger.debug("Empty Private Segment")
+            else:
+              logger.debug("Private Segment Gap:" + str(gap) + " not > " + str(-blocklength))
+            prevMSB = msb
+        # add closing private segment, if any:
+        if prevMSB.end < contig_lengths[contig_name]:
+          real_private = max(0, contig_lengths[contig_name] - prevMSB.end)
+          ps = create_private_segment(blocklength, contig_name, prevMSB.end - blocklength + 1, contig_lengths[contig_name], real_private)
+          if ps is not None: 
+            logger.debug("Contig End Private Segment:" + ps)
+            yield (contig_lengths[contig_name] - prevMSB.end, ps_desc(assembly_id, ps_counter, real_private), ps)
+            ps_counter += 1
+
+    def count_lengths(contigs):
+      contig_lengths = {}
+      for cname in contigs:
+        contig_lengths[cname] = len(contigs[cname])
+      return contig_lengths
+
+    def reverse_mapped_MSBs(assembly_1_individual_msbs, assembly_1_contig_lengths):
+
+      # create a dictionary, keyed by contig ranges in both assemblies, that point to MSBs
+      # so we can figure out if multiple ranges all point to the same MSB:
+
+      msb_dictionary = {}
+      msb_reverse_map_assembly_1 = {}
+      msb_reverse_map_assembly_2 = {}
+
+      msb_counter = 1
+
+      for assembly_1_contig_name in sorted(assembly_1_individual_msbs):
+        contig_msbs = assembly_1_individual_msbs[assembly_1_contig_name].find(
+          0, assembly_1_contig_lengths[assembly_1_contig_name]+1
+        )
+        for msb in contig_msbs:
+          from_comment = stringify_position(assembly_1_contig_name, msb.start+1, msb.end)
+          to_comment = stringify_position(msb.value[0], msb.value[1]+1, msb.value[2], msb.value[3])
+
+          if from_comment in msb_dictionary:
+            msb_desc = msb_dictionary[from_comment]
+            msb_dictionary[to_comment] = msb_desc
+            msb_reverse_map_assembly_2[msb_desc].append(to_comment)
+
+          elif to_comment in msb_dictionary:
+            msb_desc = msb_dictionary[to_comment]
+            msb_dictionary[from_comment] = msb_desc
+            msb_reverse_map_assembly_1[msb_desc].append(from_comment)
+
+          else:
+            msb_desc = 'MSB_' + str(msb_counter) + ":" + str(msb.end-msb.start)
+            msb_dictionary[from_comment] = msb_desc
+            msb_dictionary[to_comment] = msb_desc
+            msb_reverse_map_assembly_1[msb_desc] = [from_comment]
+            msb_reverse_map_assembly_2[msb_desc] = [to_comment]
+            msb_counter += 1
+            
+      return(msb_reverse_map_assembly_1, msb_reverse_map_assembly_2)
+
+    def output_append(desc_components, seq, output_map, output_fasta):
+      output_map.write('\t'.join(desc_components) + '\n')
+      output_fasta.write('>' + ' '.join(desc_components) + '\n')
+      output_fasta.write(format_sequence(seq) + '\n')
+
+
+    def write_comments(output_map, assembly_1_contig_lengths, assembly_2_contig_lengths):
+      output_map.write("#   Hybrid Map generated on: " + time.strftime("%c") + "\n")
+      output_map.write("#   Hybrid Map generated by: " + os.path.abspath(sys.argv[0]) + "\n")
+      output_map.write("#     MSB min blocklength: " + str(blocklength) + "\n")
+      output_map.write("#\n")
+      output_map.write("# Input files:\n")
+      output_map.write("#\n")
+      output_map.write("#    Reference Assembly 1: " + os.path.abspath(ref1) + "\n")
+      output_map.write("#    Reference Assembly 2: " + os.path.abspath(ref2) + "\n")
+      output_map.write("#        Chain file: " + os.path.abspath(chain_filename) + "\n")
+      output_map.write("#\n")
+      output_map.write("# Output files:\n")
+      output_map.write("#\n")
+      output_map.write("#       Hybrid Map File: " + os.path.abspath(map_filename) + "\n")
+      output_map.write("#        Hybrid FASTA: " + os.path.abspath(hybrid_fasta) + "\n")
+      output_map.write("#\n")
+      output_map.write("# Command line used in working directory " + os.getcwd() + ":\n")
+      output_map.write("#\n")
+      output_map.write("# " + ' '.join(sys.argv) + "\n")
+      output_map.write("#\n")
+      output_map.write("# Assembly 1 Contig Lengths: ")
+      output_map.write(",".join("=".join((str(contig),str(size))) for contig, size in assembly_1_contig_lengths.items()))
+      output_map.write("\n")
+      output_map.write("# Assembly 2 Contig Lengths: ")
+      output_map.write(",".join("=".join((str(contig),str(size))) for contig, size in assembly_2_contig_lengths.items()))
+      output_map.write("\n")
+      output_map.write("#\n")
+      output_map.write("\n")
+
+
+    # Initialisation:
+
+    msb_counter = 0
+    ps_counter = 0
+
+    assembly_1_contigs = get_contigs(ref1)
+    assembly_2_contigs = get_contigs(ref2)
+
+    # Get MSB info from the chain file:
+
+    (assembly_1_overlapped_msbs, assembly_1_individual_msbs,
+    assembly_2_overlapped_msbs, assembly_2_individual_msbs) = process_chain_filename(chain_filename, blocklength) #, assembly_1_contigs, assembly_2_contigs)
+
+    assembly_1_contig_lengths = count_lengths(assembly_1_contigs)
+    assembly_2_contig_lengths = count_lengths(assembly_2_contigs)
+
+
+    with open(hybrid_fasta, 'w') as output_fasta:
+      with open(map_filename, 'w') as output_map:
+
+        # Write some comments to the map file:
+        write_comments(output_map, assembly_1_contig_lengths, assembly_2_contig_lengths) 
+
+        # Create FASTA records for each MSB:
+        msb_total = 0
+        msb_reverse_map_assembly_1, msb_reverse_map_assembly_2 = reverse_mapped_MSBs(assembly_1_individual_msbs, assembly_1_contig_lengths)
+        for msb_desc in sorted(msb_reverse_map_assembly_1, key=extract_msb_id):
+          seq = get_sequence(assembly_1_contigs, msb_reverse_map_assembly_1[msb_desc][0]) # use the first matching region (they are all same)
+          desc_components = [msb_desc, '|'.join(msb_reverse_map_assembly_1[msb_desc]), '|'.join(msb_reverse_map_assembly_2[msb_desc])]
+          output_append(desc_components, seq, output_map, output_fasta)
+          msb_total += len(seq) * (len(msb_reverse_map_assembly_1[msb_desc]) + len(msb_reverse_map_assembly_2[msb_desc]))
+
+        # FASTA for assembly_1 private segments:
+        ps_ex_len_total = 0
+        ps_in_len_total = 0
+
+        ps1_ex = 0
+        ps1_in = 0
+
+        for (ps_in_len, ps_descr, ps) in get_private_segments('1', assembly_1_individual_msbs, assembly_1_contig_lengths):
+          seq = get_sequence(assembly_1_contigs, ps)
+          desc_components = [ps_descr + ":" + str(len(seq) + 0), ps]
+          output_append(desc_components, seq, output_map, output_fasta)
+          ps_ex_len_total += len(seq)
+          ps_in_len_total += ps_in_len
+          ps1_ex += len(seq)
+          ps1_in += ps_in_len
+
+        # FASTA for assembly_2 private segments:
+        ps2_ex = 0
+        ps2_in = 0
+
+        for (ps_in_len, ps_descr, ps) in get_private_segments('2', assembly_2_individual_msbs, assembly_2_contig_lengths):
+          seq = get_sequence(assembly_2_contigs, ps)
+          desc_components = [ps_descr + ":" + str(len(seq) + 0), ps]
+          output_append(desc_components, seq, output_map, output_fasta)
+          ps_ex_len_total += len(seq)
+          ps_in_len_total += ps_in_len
+          ps2_ex += len(seq)
+          ps2_in += ps_in_len
+
+      # Note that some contigs in either assembly may have *no* MSB - in this case the entire contig
+      # must be included in our hybrid as a single private segment:
+
+      pps_counter = 1
+      processed = assembly_2_contig_lengths.keys()  
+      for x in assembly_2_contigs:
+        if x not in processed:
+          seq = assembly_2_contigs[x]
+          ps = create_private_segment(0, x, 1, len(seq), len(seq))
+          ps_descr = ps_desc('2', 'p' + str(pps_counter), len(seq))
+          desc_components = [ps_descr + ":" + str(len(seq) + 0), ps]
+          output_append(desc_components, seq, output_map, output_fasta)
+          ps_ex_len_total += len(seq)
+          ps_in_len_total += len(seq)
+          ps2_ex += len(seq)
+          ps2_in += len(seq)
+
+      print
+      print("MSB total: " + str(msb_total))
+      print("PRIVATE interior total: " + str(ps_in_len_total))
+      print("PRIVATE expanded total: " + str(ps_ex_len_total))
+
+
+      print("PRIVATE 1 interior total: " + str(ps1_in))
+      print("PRIVATE 1 expanded total: " + str(ps1_ex))
+      print("PRIVATE 2 interior total: " + str(ps2_in))
+      print("PRIVATE 2 expanded total: " + str(ps2_ex))
+
+
+  # mummer_make_map() logic:
+
+  # Hidden output files (for developers):
+
+  mum_filename = output_dir + '/.mummer.mum'
+  chain_filename = output_dir + '/.assembly_map.pseudo.chain'
+
+  # Output files (for users):
+
+  map_filename = output_dir + '/msb.map'
+  hybrid_fasta = output_dir + '/hybrid_assembly.fa'
+
+  mkdir_if_reqd(mum_filename)
+
+  # Invoke mummer to find MSBs:
+  
+  invoke_mummer(blocklength, ref_a, ref_b, mum_filename)
+
+  # Process the mummer mum file and generate a UCSC-chainfile-like file as an
+  # intemediate representation of our map. This is intended to be developed further
+  # to produce a genuine UCSC chainfile that could be used with other third party
+  # tools such as liftover: 
+  
+  mummer_to_chain(mum_filename, ref_a, ref_b, chain_filename)
+
+  # Finally, create a hybrid reference FASTA file of all MSB and PRIVATE segments,
+  # along with the actual msb map (in our own custom format):
+
+  create_hybrid_fasta(chain_filename, blocklength, ref_a, ref_b, hybrid_fasta, map_filename)
+
+
+
+
+def lift_over(mapping, rev_mapping, assembly_id, bed_filename, new_filename, unmap_filename, translateChrs=False):
+
+  total_snps, msb_snps, failed = 0, 0, 0
+  #snp = []
+
+  with open(bed_filename, 'rU') as f:
+    for line in f:
+      if not line.startswith('track'):
+
+        total_snps += 1
+        snp = line.split()
+
+        if translateChrs: 
+          snp[0] = snp[0][3:]
+          if snp[0].startswith('M'): snp[0] = 'MT'
+
+        hyb_coords = remap_coordinates(
+          'simple_query', assembly_id, mapping, snp[0], int(snp[1]), int(snp[2]), snp[5]
+        )
+
+        if hyb_coords is None:
+          if failed == 0: um_file = open(unmap_filename, 'w')
+          failed += 1
+          logger.info("Failed to remap: " + ' '.join(snp))
+          um_file.write('\t'.join(snp) + '\n')
+        else:
+          h_contig, hs, he, hstr = hyb_coords[0]
+          t_coords = remap_coordinates(
+            'simple_query',
+            get_opposite_assembly_id(assembly_id), 
+            rev_mapping,
+            *hyb_coords[0]
+          )
+          if t_coords is None:
+            if failed == 0: um_file = open(unmap_filename, 'w')
+            failed += 1
+            logger.debug("Failed to reverse remap: " + ' '.join(snp) + ' (' + h_contig + ')')
+            um_file.write('\t'.join(snp) + '\n')
+          else:
+            if total_snps - failed == 1: new_file = open(new_filename, 'w')
+            details = t_coords[0]
+            new_file.write(
+              details[0] + '\t' + 
+              str(details[1]) + '\t' + 
+              str(details[2]) + '\t' + 
+              snp[3] + '\t' + 
+              snp[4] + '\t' + 
+              details[3] + '\n'
+            )
+
+          if h_contig.startswith('MSB'): msb_snps += 1
+
+  print('\t'.join([bed_filename, str(total_snps), str(msb_snps), str(failed)]))
+
+
+def bam_header_generator(orig_header, chrom_size, new_reference_fasta, prog_name, prog_ver, co, format_ver=1.0, sort_type = 'coordinate'):
+
+  bamHeaderLine = orig_header
+  name2id = {}
+  id2name = {}
+  id = 0
+  bamHeaderLine['HD'] = {'VN':format_ver,'SO':sort_type}
+
+  tmp = []
+  for ref_name in sorted(chrom_size):
+    tmp.append({'LN':int(chrom_size[ref_name]), 'SN':ref_name, 'UR':new_reference_fasta})
+    name2id[ref_name] = id
+    id2name[id] = ref_name
+    id += 1
+  bamHeaderLine['SQ'] = tmp
+  
+
+  if 'PG' in bamHeaderLine:
+    bamHeaderLine['PG'].append({'ID':prog_name,'VN':prog_ver})
+  else:
+    bamHeaderLine['PG'] = [{'ID':prog_name,'VN':prog_ver}]
+  
+  for comment in co:
+    if 'CO' in bamHeaderLine:
+      bamHeaderLine['CO'].append(comment)
+    else:
+      bamHeaderLine['CO'] = [comment]
+
+  return (bamHeaderLine, name2id, id2name)
+
+def intersectRanges((query_start, query_end), (ref_start, ref_end)):
+  if int(query_start) > int(query_end) or int(ref_start) > int(ref_end):
+    raise Exception ("Invalid coordinates (start > end).")
+  if int(query_start) > int(ref_end) or int(query_end) < int(ref_start):
+    return None
+  return (max(query_start, ref_start), min(query_end, ref_end))
+
+
+def open_samfile(filename): 
+
+  try:
+    samfile = pysam.AlignmentFile(filename, 'rb')
+    filetype = 'bam'
+    if samfile.is_cram:
+      samfile.close()
+      samfile = pysam.AlignmentFile(filename, 'rc')
+      filetype = 'cram'
+  except:
+    try:
+      samfile = pysam.Samfile(filename, 'rc')
+      filetype = 'cram'
+    except:
+      samfile = pysam.Samfile(filename, 'r')
+      filetype = 'sam'
+
+  if len(samfile.header) == 0:
+    print >>sys.stderr, ' '.join(filename, filetype.upper(), 'file missing header section.')
+    quit(1)
+
+  return(samfile, filetype)
+
+def samfile_details(sam_filename):
+  samfile, filetype = open_samfile(sam_filename)
+  return(samfile, filetype)
+
+def get_region_contig_name(region_desc):
+  rdesc = region_desc.split(':')
+  return(':'.join(rdesc[:-1]))
+
+def get_region_range(region_desc):
+  rdesc = region_desc.split(':')
+  region_range = rdesc[len(rdesc)-1]
+  region_start, region_end = map(int, region_range.split('-'))
+  return(region_start, region_end)
+
+def get_region_details(region_desc):
+  rdesc = region_desc.split(':')
+  contig_name = ':'.join(rdesc[:-1])
+  region_range = rdesc[len(rdesc)-1]
+  region_start, region_end = map(int, region_range.split('-'))
+  return(contig_name, region_start, region_end)
+
+def get_region_desc(coords):
+  if coords is None: return None
+  if (len(coords) < 4): return None
+  return(coords[0] + ':' + str(coords[1]) + '-' + str(coords[2]))
+
+def get_contig_lengths(filename):
+
+  def extract_contig_lengths(fp):
+    name, seq = None, []
+    for line in fp:
+      line = line.rstrip()
+      if line.startswith(">"):
+        if name: yield (name, len(''.join(seq)))
+        name, seq = line.split()[0].replace(">", "").strip(), []
+      else:
+        seq.append(line)
+    if name: yield (name, len(''.join(seq)))
+
+  contig_lengths = {}
+
+  with open(filename) as fp:
+    for name, length in extract_contig_lengths(fp):
+      contig_lengths[name] = length
+
+  return(contig_lengths)
+
+
+def load_mapping_file(filename):
+
+  mapping = {
+    '1' : {},
+    '2' : {}
+  }
+
+  rev_mapping = {
+    '1' : {},
+    '2' : {}
+  }
+
+  overlaps = {
+    '1' : {},
+    '2' : {}
+  }
+
+  ref_a, ref_b, ref_hybrid = None, None, None
+
+  refs_contig_lengths, hybrid_contig_lengths = {}, {}
+
+  def extract_cached_contig_lengths(csv_pairs):
+    ref_contig_lengths = {}
+    contig_length_pairs = csv_pairs.split(',')
+    for pair in contig_length_pairs:
+      contig, length = pair.split("=")
+      ref_contig_lengths[contig] = length
+    return(ref_contig_lengths)
+
+  def storeIntervals(assembly_name, matching_ranges, hybrid_contig_name, hybrid_size):
+    for assembly_range in matching_ranges:
+
+      if ' ' in assembly_range:
+        assembly_to_from, assembly_strand = assembly_range.split(' ')
+      else:
+        assembly_to_from = assembly_range
+        assembly_strand = '+'
+      (contig_name, istart, iend) = get_region_details(assembly_to_from)
+      contig_range_start = str(istart)
+      contig_range_end = str(iend)
+
+
+      if contig_name not in mapping[assembly_name]:
+        mapping[assembly_name][contig_name] = Intersecter()
+        overlaps[assembly_name][contig_name] = ClusterTree(0, 0)
+
+      mapping[assembly_name][contig_name].add_interval(
+        Interval(int(contig_range_start), int(contig_range_end), (hybrid_contig_name, 1, int(hybrid_size), assembly_strand))
+      )
+      if hybrid_contig_name.startswith("MSB"):
+        overlaps[assembly_name][contig_name].insert(
+          int(contig_range_start), int(contig_range_end), 0
+        )
+      if hybrid_contig_name not in rev_mapping[assembly_name]:
+        rev_mapping[assembly_name][hybrid_contig_name] = Intersecter()
+
+      rev_mapping[assembly_name][hybrid_contig_name].add_interval(
+        Interval(1, int(hybrid_size), (contig_name, int(contig_range_start), int(contig_range_end), assembly_strand))
+      )
+
+    hybrid_contig_lengths[hybrid_contig_name] = hybrid_size
+  
+  for line in open(filename):
+    line = line.strip()
+    if not line or line.startswith(('#', ' ')): 
+      if "Reference Assembly 1:" in line:
+        ref_a = line.split(":")[1].strip()
+      elif "Reference Assembly 2:" in line:
+        ref_b = line.split(":")[1].strip()
+      elif "Assembly 1 Contig Lengths:" in line:
+        line_components = line.split(":")
+        refs_contig_lengths['1'] = extract_cached_contig_lengths(':'.join(line_components[1:]).strip())
+      elif "Assembly 2 Contig Lengths:" in line:
+        line_components = line.split(":")
+        refs_contig_lengths['2'] = extract_cached_contig_lengths(':'.join(line_components[1:]).strip())
+      elif "Hybrid FASTA:" in line:
+        ref_hybrid = line.split(":")[1].strip()
+      continue
+    fields = line.split('\t')
+
+    hybrid_details = fields[0].split(':')
+    hybrid_contig_name = hybrid_details[0]
+    hybrid_contig_name = fields[0]
+    hybrid_size = hybrid_details[1]
+    if len(hybrid_details) == 3:
+      hybrid_size = hybrid_details[2]
+
+    if fields[0].startswith('MSB'):
+      storeIntervals('1', fields[1].split('|'), hybrid_contig_name, hybrid_size)
+      storeIntervals('2', fields[2].split('|'), hybrid_contig_name, hybrid_size)
+    else:
+      assembly_name = hybrid_contig_name.split('_')[1]
+      matching_ranges = fields[1].split('|')
+      storeIntervals(assembly_name, matching_ranges, hybrid_contig_name, hybrid_size)
+
+  return (mapping, rev_mapping, overlaps, hybrid_contig_lengths, refs_contig_lengths, ref_a, ref_b, ref_hybrid)
+
+def reorder(matches):
+
+  # Very simple heuristics to ensure MSB is returned where possible,
+  # and that primary assembly (not alt contig) is returned where possible
+
+  def swap_match(idx, matches):
+    if idx == 0: return matches
+    tmp = matches[idx]
+    matches[idx] = matches[0]
+    matches[0] = tmp
+    return matches
+  
+  if (len(matches) < 2): return matches
+
+  # Heuristic for best hybrid match:  
+  for idx, match in enumerate(matches):
+    if match[0].startswith("MSB"):
+      return(swap_match(idx, matches))
+
+  # Heuristic for best ref assembly match:
+  for idx, match in enumerate(matches):
+    if not match[0].endswith("_alt"):
+      return(swap_match(idx, matches))
+
+  return matches
+   
+def remap_coordinates(task, assembly_id, mapping, sample_contig_name, q_start, q_end, q_strand='+'):
+  
+  matches = []
+  complement = {'+':'-','-':'+'}
+
+  mapping = mapping[assembly_id]
+
+  logger.debug("remap_coordinates sample:" + sample_contig_name + " " + str(q_start) + ":" + str(q_end) + " " + q_strand)
+  if sample_contig_name not in mapping:
+    return None
+
+  targets = mapping[sample_contig_name].find(q_start, q_end) 
+
+  if len(targets) == 0: 
+    logger.debug("REMAP: no targets " + sample_contig_name+ ":" + str(q_start) + "-" + str(q_end))
+    return None
+
+  logger.debug("Target count=" + str(len(targets)))
+  for t in targets:
+
+    logger.debug("Target " + sample_contig_name + " " + str(t.start) + ":" + str(t.end) + " -> " + t.value[0] + " " + str(t.value[1]) + ":" + str(t.value[2]) + " " + str(t.value[3]))
+
+    sample_contig_start = t.start
+    sample_contig_stop = t.end
+
+    hybrid_contig_name = t.value[0]
+    hybrid_contig_start = t.value[1]
+    hybrid_contig_stop = t.value[2]
+    hybrid_contig_strand = t.value[3]
+    logger.debug("Hybrid:" + str(hybrid_contig_start) + "-" + str(hybrid_contig_stop) + " " + hybrid_contig_strand)
+    
+    (real_start, real_end) = intersectRanges((q_start,q_end),(sample_contig_start,sample_contig_stop))
+    offset_from_contig_start = abs(real_start - sample_contig_start)
+    size = abs(real_end - real_start)
+
+    if hybrid_contig_strand == '+':
+      i_start = hybrid_contig_start + offset_from_contig_start
+    elif hybrid_contig_strand == '-':
+      i_start = hybrid_contig_stop - offset_from_contig_start - size
+    else:
+      raise Exception("Invalid strand (%s). Should be '+' or '-'." % q_strand)
+
+    if q_start >= sample_contig_start and q_end <= sample_contig_stop:
+      if q_strand == '+':
+        logger.debug("match: " + hybrid_contig_name + " " + str(i_start) + ":" + str(i_start + size) + " " + hybrid_contig_strand)
+        matches.append( (hybrid_contig_name, i_start,  i_start + size, hybrid_contig_strand) )
+      else:
+        logger.debug("match: " + hybrid_contig_name + " " + str(i_start) + ":" + str(i_start + size) + " " + complement[hybrid_contig_strand])
+        matches.append( (hybrid_contig_name, i_start,  i_start + size, complement[hybrid_contig_strand]) )
+
+    else:
+      logger.debug("toosmall:" + hybrid_contig_name + " " + str(i_start) + ":" + str(i_start + size) + " " + hybrid_contig_strand)
+      logger.debug("info:" + ','.join(map(str, [q_start, q_end, sample_contig_start, sample_contig_stop])))
+  logger.debug("SUCCESS: " + str(len(matches)))
+  if len(matches) == 0:
+
+    logger.info("FATAL for: " + ' '.join([sample_contig_name, str(q_start), str(q_end), q_strand]))
+    for t in targets:
+
+      sample_contig_start = t.start
+      sample_contig_stop = t.end
+
+      hybrid_contig_name = t.value[0]
+      hybrid_contig_start = t.value[1]
+      hybrid_contig_stop = t.value[2]
+      hybrid_contig_strand = t.value[3]
+
+      logger.info(" From: " + sample_contig_name + ":" + str(sample_contig_start) + "-" + str(sample_contig_stop))
+      logger.info("   To: " + hybrid_contig_name + ":" + str(hybrid_contig_start) + "-" + str(hybrid_contig_stop) + " " +hybrid_contig_strand)      
+        
+    return None
+
+  return(reorder(matches))
+
+
+def generate_sam_header(samfile, filetype, filename, msb_mapping_file, targetChromSizes, new_reference_fasta, task):
+  comments = [ ' '.join(['MSB', task, 'from', filetype.upper(), 'file:', filename]) ]
+  comments.append('MSB ' + task + ' using MSB mapping file: ' + msb_mapping_file)
+  return(bam_header_generator(
+    orig_header = samfile.header, 
+    chrom_size = targetChromSizes, 
+    new_reference_fasta = new_reference_fasta,
+    prog_name = 'tamtools.py',
+    prog_ver = '0.1', 
+    format_ver = 1.0,
+    sort_type = 'coordinate',
+    co = comments
+  ))
+
+
+def generate_filenames(outfile_prefix, filename, filetype):
+  if outfile_prefix == '-':
+    return('-', re.sub("(\." + filetype + ")$", ".unmap\\1", filename))
+  else:
+    return(outfile_prefix + '.' + filetype, outfile_prefix + '.unmap.' + filetype)
+
+def hybrid_name_to_inner_size(name): return(int(name.split(':')[1]))
+
+def hybrid_name_to_outer_size(name): return(int(name.split(':')[2]))
+
+def get_read1_maps(task, read1_chr, assembly_id, samfile, mapping, old):  
+  read1_strand = '-' if old.is_reverse else '+'
+  return(remap_coordinates(task, assembly_id, mapping, read1_chr, old.reference_start, old.reference_end, read1_strand))
+
+
+def get_read2_maps(task, assembly_id, samfile, mapping, old):
+
+  logger.debug("get_read2_maps")
+  if old.mate_is_unmapped: return(None)
+  try:
+    read2_chr = samfile.get_reference_name(old.next_reference_id)                  
+    read2_strand = '-' if old.mate_is_reverse else '+'
+    read2_start = old.next_reference_start
+    read2_end = read2_start + 1
+    return(remap_coordinates(task, assembly_id, mapping, read2_chr, read2_start, read2_end, read2_strand))
+  except:
+    return(None)
+
+def process_paired_read(task, assembly_id, mapping, name_to_id, samfile, old, new):
+
+  # flag: read paired
+  new.flag = 0x0001  
+
+  if old.is_read1: 
+    # flag: first in pair
+    new.flag = new.flag | 0x40 
+
+  if old.is_read2: 
+    # flag: second in pair 
+    new.flag = new.flag | 0x80 
+  
+  try:
+    read1_chr = samfile.get_reference_name(old.reference_id)
+  except:
+    return False
+
+  read1_maps = get_read1_maps(task, read1_chr, assembly_id, samfile, mapping, old)
+  read2_maps = get_read2_maps(task, assembly_id, samfile, mapping, old)
+  
+  if read1_maps is None:
+    if read2_maps is None: 
+      return False
+    else:
+      # flag: first read unmapped
+      new.flag = new.flag | 0x4 
+
+      if len(read2_maps) > 1:
+        # flag: not primary alignment
+        new.flag = new.flag | 0x100
+        new.mapping_quality = 255
+      else:
+        new.mapping_quality = old.mapping_quality
+
+      if read2_maps[0][3] == '-': 
+        # flag: mate reverse strand
+        new.flag = new.flag | 0x20 
+
+      new.reference_id = name_to_id[read2_maps[0][0]]
+      new.reference_start = 0
+      new.cigar = old.cigar
+      new.next_reference_id = name_to_id[read2_maps[0][0]]
+      new.next_reference_start =  read2_maps[0][1]
+      new.template_length = 0
+      return(new)
+
+  elif len(read1_maps) >= 1:
+
+    if len(read1_maps) > 1: 
+      # flag: not primary alignment
+      new.flag = new.flag | 0x100 
+      new.mapping_quality = 255
+    else:
+      new.mapping_quality = old.mapping_quality
+  
+    logger.debug(("negative" if old.is_reverse else "positive") + read1_maps[0][3])
+    if read1_maps[0][3] == '-': 
+      # flag: read reverse strand
+      logger.debug("flag: read reverse strand")
+      new.flag = new.flag | 0x10 
+
+    new.reference_id = name_to_id[read1_maps[0][0]]  #chrom
+    new.reference_start = read1_maps[0][1] - 0 
+    new.cigar = old.cigar
+    
+    if (old.mate_is_unmapped) or (read2_maps is None):
+      # flag: mate unmapped
+      new.flag = new.flag | 0x8 
+      new.next_reference_id = name_to_id[read1_maps[0][0]]
+      new.next_reference_start =  0
+      new.template_length = 0
+    else:
+      if read2_maps[0][3] == '-': new.flag = new.flag | 0x20
+      new.next_reference_id = name_to_id[read2_maps[0][0]]
+      new.next_reference_start =  read2_maps[0][1]
+      logger.debug("READ1: " + str(new.reference_id) + " " + ' '.join(map(str, read1_maps[0])))
+      logger.debug("READ2: " + str(new.next_reference_id) + " " + ' '.join(map(str, read2_maps[0])))
+      new.template_length = abs(read2_maps[0][2] - 1 - new.reference_start)
+      if len(read2_maps) > 2:
+        # flag: not primary alignment
+        new.flag = new.flag | 0x100 
+      else:
+        if read2_maps[0][3] != read1_maps[0][3]:
+          new.flag = new.flag | 0x2
+
+
+    return(new)
+
+  else:
+    return False
+
+
+def process_single_read(task, assembly_id, mapping, name_to_id, samfile, old, new):
+
+  new.flag = 0
+  read_chr = old.reference_name
+  read_strand = '-' if old.is_reverse else '+'
+  
+  read_start = old.reference_start
+  read_end = old.reference_end
+
+  
+  logger.debug("process_single_read")
+  read_maps = remap_coordinates(task, assembly_id, mapping, read_chr, read_start, read_end, read_strand)
+  
+  if read_maps is None:
+    return(False)
+
+  # perhaps we should use some heuristic here to choose
+  # best read_map if we len(read_maps) > 1:
+
+  if len(read_maps) > 0:
+    new.reference_id = name_to_id[read_maps[0][0]]
+    new.reference_start = read_maps[0][1]
+    new.mapping_quality = old.mapping_quality
+    new.cigar = old.cigar
+
+    if read_maps[0][3] == '-':
+      # flag: read reverse strand
+      new.flag = new.flag | 0x10
+    return(new)
+
+def mkdir_if_reqd(filename):
+  if filename == '-': return
+  if not os.path.exists(os.path.dirname(filename)):
+    try:
+      os.makedirs(os.path.dirname(filename))
+    except OSError as rc: # race condition
+      if rc.errno != errno.EEXIST:
+        raise
+
+def have_reads(list_of_sams):
+
+  def contains_reads(sam_filename):
+    try:
+      (samfile, filetype) = open_samfile(sam_filename)
+      firstread = samfile.next()
+      return(True)
+    except StopIteration:
+      return(False)
+
+  keep = []
+  for sam_filename in list_of_sams:
+    if contains_reads(sam_filename): keep.append(sam_filename)
+  return(keep)
+
+
+def remap_sample(task, samfile, filetype, sam_filename, output_filename, unmap_filename, old_reference_fasta, new_reference_fasta, assembly_id, mapping_file, mapping, chromSizes, tag_new_msb_reads=False):
+
+  # Generate the new alignment file SAM header:
+  new_header, name_to_id, id_to_name = generate_sam_header(samfile, filetype, sam_filename, mapping_file, chromSizes, new_reference_fasta, task)
+
+  mkdir_if_reqd(output_filename)
+  output_fp = pysam.AlignmentFile( filename=output_filename, mode=sam_write_flags[filetype], header=new_header )
+  unmap_fp = None
+  if unmap_filename is not None:
+    mkdir_if_reqd(unmap_filename)
+    unmap_fp = pysam.AlignmentFile( filename=unmap_filename, mode=sam_write_flags[filetype], header=new_header )
+
+  total_item = 0
+  failed = 0
+  ignoremsbs = 0
+  try:
+    while 1:
+
+      total_item += 1
+      old = samfile.next()
+      new = pysam.AlignedRead()  
+      
+      if old.is_qcfail or old.is_unmapped:
+        failed += 1
+        logger.debug(str(total_item) + " FAILURE QC or OLD_UNMAPPED")
+        if old.is_qcfail:
+          logger.debug("Unmappable Read: QC Failure")
+          # let us not store QC fail reads for now
+        else:
+          logger.debug("Unmappable Read: Original Unmapped")
+          if unmap_fp is not None: unmap_fp.write(old)
+        continue
+      
+      new.query_name = old.query_name
+      new.query_sequence = old.query_sequence
+      new.query_qualities = old.query_qualities
+      new.set_tags(old.get_tags())
+
+      if old.is_paired:
+        new = process_paired_read(task, assembly_id, mapping, name_to_id, samfile, old, new)
+      else:
+        new = process_single_read(task, assembly_id, mapping, name_to_id, samfile, old, new)
+
+      if type(new) == type(False) or new is None:
+        if unmap_fp is not None: unmap_fp.write(old)
+        logger.debug(str(total_item) + " FAILURE TO MAP")
+        failed += 1
+      else:
+        if tag_new_msb_reads:
+          if id_to_name[new.reference_id].startswith('MSB'):
+            new.set_tags(old.get_tags() + [('MO', assembly_id)])
+
+        # Do not include MSB reads that were found only AFTER aligment to the 
+        # second reference in a tamtools hybridize process:
+
+        if task == 'view' and old.has_tag('MO'):
+          if old.get_tag('MO') != assembly_id:
+            logger.debug("Ignoring new second-assembly-msb")
+            continue
+
+        logger.debug(str(total_item) + " OK: " + ("Paired" if old.is_paired else "Single"))
+        output_fp.write(new)
+                
+  except StopIteration:
+    total_item -= 1
+    logger.info(' '.join(["Total entries:", str(total_item)]))
+    logger.info(' '.join(["Failed to map:", str(failed)]))
+
+
+def show_stats(overlaps, mapping, rev_mapping, ref_a, ref_b, refsChromSizes):
+
+  def mean(data): return sum(data) / float(len(data))
+
+  def stdev(data):
+    return (sum((x-mean(data))**2 for x in data) / float(len(data)-1)) ** 0.5
+
+  def get_stats(refid):
+    intervals = mapping[refid]
+    overlapped_msbs = overlaps[refid]
+    contigSizes = refsChromSizes[refid]
+
+    tot = 0 
+    counts = []
+
+    msb_bp_used = 0
+    ref_assembly_length = 0
+
+    table = []
+    headers = ["Contig", "Size", "MSB %age", "MSB Bp", "Private Bp"]
+
+    msb_pcs = []
+
+    n50_overlapped_msb_regions = []
+    n50 = 0
+
+    all_ps = 0 # total length of all private segments
+
+    # How many contigs in the original assembly?
+    num_orig_contigs = len(contigSizes)
+
+    # How many MSB contigs (incl nested) in the assembly?
+    num_individual_msbs = 0
+    num_individual_privates = 0
+
+    for cname in rev_mapping[refid]:
+      if cname.startswith("MSB"):
+        num_individual_msbs += 1
+      else:
+        num_individual_privates += 1
+        all_ps += hybrid_name_to_inner_size(cname)
+
+    for cname in sorted(contigSizes):
+      shared_regions_length = 0
+      if cname in overlapped_msbs:
+        contig_msb_regions = overlapped_msbs[cname]
+        for overlapping_msb_region in contig_msb_regions.getregions():
+          msb_region_start, msb_region_end, ids = overlapping_msb_region
+          overlapping_msb_length = (msb_region_end - msb_region_start) + 1
+          n50_overlapped_msb_regions.append(overlapping_msb_length)
+          shared_regions_length += overlapping_msb_length
+        
+        msb_bp_used += shared_regions_length
+        shared_regions_length_pc = (
+          100 * shared_regions_length / float(int(contigSizes[cname]))
+        )  
+
+      else:
+        shared_regions_length_pc = 0
+
+      ref_assembly_length += int(contigSizes[cname])
+      msb_pcs.append(shared_regions_length_pc)
+
+      row = []
+      row.append(cname)
+      row.append(contigSizes[cname])
+      row.append("{0:.1f}%".format(shared_regions_length_pc))
+      row.append(shared_regions_length)
+      row.append(int(contigSizes[cname]) - shared_regions_length)
+      table.append(row)
+
+    # Calculate MSB N50:
+    n50_overlapped_msb_regions.sort(reverse=True)
+    msb_region_sum = 0
+    for overlapping_msb_length in n50_overlapped_msb_regions:
+      msb_region_sum += overlapping_msb_length
+      if (msb_region_sum * 2 > ref_assembly_length):
+        n50 = overlapping_msb_length
+        break
+
+    # How many overlapped (merged) MSB reguons in the assembly?
+    num_overlapped_msb_regions = len(n50_overlapped_msb_regions)
+
+    report = tabulate(table, headers, tablefmt="psql")
+
+    return(ref_assembly_length, msb_bp_used, all_ps, n50, 
+           num_orig_contigs, num_individual_msbs, num_individual_privates, 
+           num_overlapped_msb_regions, report)
+
+  def show_summary(ref_id, ref_fasta_file, tot, msb, all_ps, n50, num_orig_contigs, num_indiv_msbs, num_indiv_ps, num_over_msb_reg):
+    msbpc = "{0:.1f}".format(100 * msb / float(tot))
+    print
+    print("   Reference Assembly " + ref_id + ": " + ref_fasta_file)
+    print("               Total Bp: " + str(tot))
+    print("              # Contigs: " + str(num_orig_contigs))
+    print("                 MSB Bp: " + str(msb) + " (" + msbpc + "%)")
+    print("    # MSBs (inc nested): " + str(num_indiv_msbs))
+    print("  # MSB overlapped reg.: " + str(num_over_msb_reg))
+    print("             Private Bp: " + str(tot-msb))
+    print("                MSB N50: " + str(n50))
+
+  def get_all_msb_bp_count():
+    all_msb = 0
+    for cname in rev_mapping['1']: # same as '2' as symmetric
+      if cname.startswith("MSB"):
+        all_msb += hybrid_name_to_inner_size(cname)
+    return all_msb
+      
+  (tot1, msb1, all_ps_1, n50_1, num_orig_contigs_1, num_indiv_msbs_1, num_indiv_ps_1, num_over_msb_reg_1, report1) = get_stats('1')
+  (tot2, msb2, all_ps_2, n50_2, num_orig_contigs_2, num_indiv_msbs_2, num_indiv_ps_2, num_over_msb_reg_2, report2) = get_stats('2')
+
+  print("\nReference Assembly 1: " + ref_a + "\n") 
+  print(report1)
+  print("\nReference Assembly 2: " + ref_b + "\n") 
+  print(report2)
+  print
+  print("Summary:")
+  show_summary('1', ref_a, tot1, msb1, all_ps_1, n50_1, num_orig_contigs_1, num_indiv_msbs_1, num_indiv_ps_1, num_over_msb_reg_1)
+  show_summary('2', ref_b, tot2, msb2, all_ps_2, n50_2, num_orig_contigs_2, num_indiv_msbs_2, num_indiv_ps_2, num_over_msb_reg_2)
+  print
+
+def full_hybridization(
+  sam_filename, output_directory, old_reference_fasta, new_reference_fasta, 
+  assembly_id, ref_a, ref_b, mapping_file, mapping, rev_mapping, chromSizes
+  ):
+
+  def get_hybridization_filename(ref_id, output_directory, filetype, prefix):
+    return output_directory + "/" + prefix + "_" + ref_id + "." + filetype
+
+  def get_fastq_filename(ref_id, output_directory, prefix):
+    return output_directory + "/" + prefix + "_" + ref_id + ".fastq"
+
+  def make_unmap_fastq(unmap_filename, fasta_filename):
+    fastq_fp = open(fasta_filename, "w")
+    fastq_fp.write(pysam.bam2fq(unmap_filename))
+    fastq_fp.close()
+
+  def make_first_private_fastq(assembly_id, ph_a, ph_a_priv, a_priv_contigs, ph_a_priv_fastq):
+
+    # first, get a list of all the hybrid chromosomes we want to keep (i.e. all privates):
+    keep = []
+    for cname in rev_mapping[assembly_id]: 
+      if cname.startswith("PRIVATE"):
+        keep.append('\t'.join([cname, '0', str(hybrid_name_to_outer_size(cname) + 1)]))
+    keep_fp = open(a_priv_contigs, "w")
+    keep_fp.write('\n'.join(keep))
+    keep_fp.close()
+
+    # Then, use samtools view to extract only reads in these regions to a new BAM:
+    private_fp = open(ph_a_priv, "w")
+    private_fp.write(pysam.view('-b', '-L', a_priv_contigs, ph_a))
+    private_fp.close()
+
+    # Finally, convert these reads to a FASTQ file:
+    fastq_fp = open(ph_a_priv_fastq, "w")
+    fastq_fp.write(pysam.bam2fq(ph_a_priv))
+    fastq_fp.close()
+
+  def bwa_mem(ref_fasta_filename, fastq_filename, output_bam):
+
+    command = "bwa mem " + ref_fasta_filename + " " + fastq_filename + " > " + output_bam
+    return_code = subprocess.call(command, shell=True)
+    if return_code != 0:
+      print("Could not run shell command: " + command)
+      print("Exit code: " + str(return_code))
+      if return_code == 127:
+        print("Please ensure bwa executable (with mem support) is in your $PATH environment variable.")
+        print("e.g.: export PATH=/utils/bwa/:$PATH")
+      quit(1)
+
+  # We create a lot of temporary files. This is a one off process so is not 
+  # terribly inefficient, but performance could perhaps be improved by using
+  # named pipes instead:
+
+  # ph_a = the partial hybrid alignment from Reference A (will include all relevant MSBs)
+  # unmap_a = original unmapped reads
+  ph_a_presort = output_directory + "/ph_" + assembly_id + ".unsorted.bam"
+  ph_a = output_directory + "/ph_" + assembly_id + ".bam"
+  unmap_a = output_directory + "/unmap_" + assembly_id + ".bam"
+
+  # ph_a_fastq = fasta file of the PRIVATE (non-MSB) reads in ph_a
+  # unmap_a_fastq = fasta file of the private reads in a_unmap
+  ph_a_priv_fastq = output_directory + "/ph_" + assembly_id + ".priv.fastq"
+  unmap_a_fastq = output_directory + "/unmap_" + assembly_id + ".fastq"
+
+  # a_priv_contigs = the contigs that contain the private reads we want to remap to ph_a_priv_fastq
+  # ph_a_priv = a subset of ph_a that contains only these 'private' reads
+  a_priv_contigs = output_directory + "/private_contigs.txt"
+  ph_a_priv = output_directory + "/ph_" + assembly_id + ".priv.bam"
+
+
+  # ph_a_priv_b = bwa alignment of reads in ph_a_priv_fastq against Reference B
+  ph_a_priv_b = output_directory + "/ph_" + assembly_id + ".priv.to." + get_opposite_assembly_id(assembly_id) + ".bam"
+
+  # unmap_a_b = bwa alignment of reads in unmap_a_fastq against Reference B
+  unmap_a_b = output_directory + "/unmap_" + assembly_id + ".to." + get_opposite_assembly_id(assembly_id) + ".bam"
+
+  # We hybridize ph_a_priv_b to produce:
+  # priv_a_b = private reads in A that successfully remap to Reference B
+  # unmap_priv_a_b = private reads in A that cannot map to Reference B either
+  priv_a_b = output_directory + "/ph_" + assembly_id + ".priv.to.ph_" + get_opposite_assembly_id(assembly_id) + ".bam"
+  unmap_priv_a_b = output_directory + "/unmap_ph_" + assembly_id + ".priv.to.ph_" + get_opposite_assembly_id(assembly_id) + ".bam"
+
+  # We hybridize unmap_a_b to produce:
+  # unmap_ph_b = orig unmapped reads that successfully map to Reference B
+  # unmap_unmap = orig unmapped reads that cannot map to Reference B either
+  unmap_ph_a_b = output_directory + "/unmap_" + assembly_id + ".to.ph_" + get_opposite_assembly_id(assembly_id) + ".bam"
+  unmap_unmap = output_directory + "/unmap_" + assembly_id + ".to.unmap_" + get_opposite_assembly_id(assembly_id) + ".bam"
+
+  # We merge the hybrids to a single hybrid alignment:
+  #   ph_a       }
+  #   priv_a_b     }  => final_hybrid_presort
+  #   unmap_ph_a_b   }  
+
+  final_hybrid_presort = output_directory + "/hybrid.unsorted.bam"
+
+  # final_hybrid_presort will be sorted and saved as final_hybrid:
+  final_hybrid = output_directory + "/hybrid.bam"
+
+  # We merge the second assembly's unmapped reads to a single file:
+  #   unmap_priv_a_b }
+  #   unmap_unmap  }  => unmap_b
+  unmap_b = output_directory + "/unmap_" + get_opposite_assembly_id(assembly_id) + ".bam"
+
+  # create output directory if it does not exist
+  mkdir_if_reqd(ph_a)
+
+  # what is the format of the original aligment?
+  samfile, filetype = samfile_details(sam_filename)
+
+  # Remap the original "reference" alignment to a hybrid alignment:
+  # We hybridize sam_filename to produce:
+  # ph_a_presort = reads in A that successfully remap to hybrid ref (hybridized)
+  # unmap_a = unmapped reads in A (refa)  
+
+  remap_sample(
+    'hybridize', 
+    samfile, filetype, sam_filename, ph_a_presort, unmap_a, 
+    old_reference_fasta, new_reference_fasta, assembly_id, 
+    mapping_file, mapping, chromSizes, tag_new_msb_reads=False
+  )
+
+  # Sort and Index the partial hybrid file for future processing
+  pysam.sort('-o', ph_a, ph_a_presort)
+  pysam.index(ph_a)
+
+  # Make a FASTQ file of the reads that could not be mapped to the hybrid reference assembly:
+  make_unmap_fastq(unmap_a, unmap_a_fastq)
+
+  # Make a FASTQ file of the reads that were mapped to Private Segments for src_ref
+  make_first_private_fastq(assembly_id, ph_a, ph_a_priv, a_priv_contigs, ph_a_priv_fastq)
+
+  # a) Align the old unmapped reads to the other reference assembly:
+  other_ref_fasta = get_reference_assembly_fasta(
+    get_opposite_assembly_id(assembly_id), ref_a, ref_b, mapping_file
+  )
+  bwa_mem(other_ref_fasta, unmap_a_fastq, unmap_a_b)
+
+  # Align the privately mapped reads to the other reference assembly:
+  if os.path.getsize(ph_a_priv_fastq) != 0:
+    bwa_mem(other_ref_fasta, ph_a_priv_fastq, ph_a_priv_b)
+  
+  # We hybridize unmap_a_b to produce:
+  # unmap_ph_a_b = unmapped reads in A that successfully align to Reference B (hybridized)
+  # unmap_unmap = unmapped reads in A that cannot align to Reference B either (refb)
+  samfile, filetype = samfile_details(unmap_a_b)
+  remap_sample(
+    'hybridize', 
+    samfile, filetype, unmap_a_b, unmap_ph_a_b, unmap_unmap, 
+    old_reference_fasta, new_reference_fasta, get_opposite_assembly_id(assembly_id), 
+    mapping_file, mapping, chromSizes, tag_new_msb_reads=True
+  )
+
+  # We hybridize ph_a_priv_b to produce:
+  # priv_a_b = private reads in A that successfully align to Reference B (hybridized)
+  # unmap_priv_a_b = private reads in A that cannot align to Reference B (refb)
+  if os.path.getsize(ph_a_priv_fastq) != 0:
+    samfile, filetype = samfile_details(ph_a_priv_b)
+    remap_sample(
+      'hybridize', 
+      samfile, filetype, ph_a_priv_b, priv_a_b, unmap_priv_a_b, 
+      old_reference_fasta, new_reference_fasta, get_opposite_assembly_id(assembly_id), 
+      mapping_file, mapping, chromSizes, tag_new_msb_reads=True
+    )
+  
+  # Merge the results:
+
+  # We start by merging all reads mapped to MSB or PRIVATE_1 or PRIVATE_2 contigs:
+  #pysam.merge('-O', "CRAM", output_directory + "/hybrid.cram", 
+  if os.path.getsize(ph_a_priv_fastq) != 0:
+    pysam.merge('-f', final_hybrid_presort, 
+      *have_reads([ph_a, priv_a_b, unmap_ph_a_b])
+    )
+  else:
+    copyfile(ph_a, final_hybrid_presort)
+
+  # We also merge all of the second reference's unmapped bybridized reads:
+  if os.path.getsize(ph_a_priv_fastq) != 0:
+    pysam.merge('-f', unmap_b, 
+      *have_reads([unmap_priv_a_b, unmap_unmap])
+    )
+  else:
+    copyfile(unmap_unmap, unmap_b)
+
+  # sort the hybrid bam file for future processing:
+  #pysam.sort('-n', final_hybrid_presort, '-o', final_hybrid)
+  # -n causes the subsequent indexing to fail:
+  #samtools index: final_hybrid is corrupted or unsorted
+
+  pysam.sort(final_hybrid_presort, '-o', final_hybrid)
+
+  # index the sorted hybrid bam file to allow random retrieval:
+  pysam.index(final_hybrid)
+
+  # Clean up:
+  for tmp_file in ([
+    ph_a_presort, 
+    ph_a, 
+    ph_a + ".bai",
+    priv_a_b, 
+    unmap_ph_a_b, 
+    unmap_priv_a_b, 
+    unmap_unmap, 
+    ph_a_priv,
+    ph_a_priv_b, 
+    unmap_a_b, 
+    ph_a_priv_fastq, 
+    unmap_a_fastq, 
+    a_priv_contigs,
+    final_hybrid_presort
+  ]): 
+    if os.path.exists(tmp_file): os.remove(tmp_file)
+
+
+def get_opposite_assembly_id(ref_id):
+  if (ref_id == '1'): return '2'
+  return '1'
+
+def get_reference_assembly_fasta(ref_id, ref_a, ref_b, mapping_file):
+  ref_assemblies = [ref_a, ref_b]
+  if (ref_id != '1' and ref_id != '2'):
+    logger.warning("Invalid reference assembly id; must be 1 or 2.")
+    logger.warning("The mapping file (" + mapping_file + ") references the following two assemblies:")
+    logger.warning(" 1 : " + ref_a)
+    logger.warning(" 2 : " + ref_b)
+    quit(1)
+  else: return(ref_assemblies[int(ref_id)-1])
+
+
+def launch_daemon(HTTP_PORT, mapping_file, quiet_flag):
+
+  if not quiet_flag: logger.info("Loading MSB map: " + mapping_file + " ...")
+
+  # Load MSB Map:
+  (mapping, rev_mapping, overlaps, hybridChromSizes, refsChromSizes, ref_a, ref_b, ref_hybrid) = load_mapping_file(mapping_file)
+  ref_assemblies = [ref_a, ref_b]
+
+  if not quiet_flag: logger.info("MSB map loaded.")
+
+  class RemapRequestHandler(BaseHTTPRequestHandler):
+
+    def log_message(self, format, *args): 
+      if not quiet_flag:
+        sys.stderr.write("%s - - [%s] %s\n" %
+           (self.address_string(),
+            self.log_date_time_string(),
+            format%args))
+
+    def do_GET(self):
+
+      def validate_param(param, acceptable_values):
+        if not param_values[param] in acceptable_values:
+          self.send_response(400, 
+            "Invalid '" + param + "' value (" + param_values[param] + 
+            "). Valid values: " + ', '.join(acceptable_values)
+          )
+          return False
+        return True
+
+      required_params = [ "ref_assembly_id", "direction", "q_contig", "q_start", "q_end", "q_strand" ]
+      params = parse_qs(urlparse(self.path).query)
+      param_values = {}
+
+      for required_param in required_params:
+        if params.get(required_param) is None:
+          return(self.send_response(400, 
+            "Required '" + required_param + 
+            "' request parameter is missing"
+          ))
+        param_values[required_param] = params.get(required_param)[0]
+
+      # Validate the request parameters:
+      if not validate_param("ref_assembly_id", [ "1", "2" ]): return
+      if not validate_param("direction", [ "forward", "backward", "translate" ]): return
+      if not validate_param("q_strand", [ "+", "-" ]): return
+
+      # Remap coordinates:
+      map_to_use = mapping
+      if param_values["direction"] == "backward":
+        map_to_use = rev_mapping
+
+      read_maps = remap_coordinates(
+        'simple_query',
+        param_values["ref_assembly_id"],
+        map_to_use,
+        param_values["q_contig"],
+        int(param_values["q_start"]),
+        int(param_values["q_end"]),
+        param_values["q_strand"]
+      )
+
+      result = read_maps[0]
+
+      if param_values["direction"] == "translate":
+        read_maps = remap_coordinates(
+          'simple_query',
+          get_opposite_assembly_id(param_values["ref_assembly_id"]),
+          rev_mapping,
+          *result
+        )
+        result = read_maps[0]
+
+      # Return response:
+      self.send_response(200)
+      self.send_header("Content-type", "application/json")
+      self.wfile.write("\r\n")
+      self.wfile.write(result)
+      logger.debug(result)
+
+  server = HTTPServer(("localhost", HTTP_PORT), RemapRequestHandler)
+  if not quiet_flag: 
+    logger.info("Coordinate remapping service listening on host: localhost port: " + str(HTTP_PORT))
+  server.serve_forever()
+
+def server_url(host, port): return("http://" + host + ":" + port + "/")
+
+def query_remap_server(url, assembly_id, direction, q_contig_name, q_start, q_end, q_strand='+'):
+  # Query the service and print result:
+  url_values = urllib.urlencode({
+    'ref_assembly_id' : assembly_id,
+    'direction' : direction,
+    'q_contig' : q_contig_name,
+    'q_start' : q_start,
+    'q_end' : q_end,
+    'q_strand' : q_strand
+  })
+  response = urllib2.urlopen(url + "?" + url_values)
+  return(response.read())
+
+
+class TAMtools(object):
+
+  def __init__(self):
+
+    parser = argparse.ArgumentParser(
+      usage=textwrap.dedent('''tamtools <command> [<args>]
+
+tamtools commands:
+
+   makemap   Creates a hybrid reference assembly (in FASTA format) and the
+             corresponding MSB map for any two reference assemblies
+
+   hybridize Converts an original alignment to a full hybrid MSB alignment
+
+   partial   Converts an original alignment to a partial hybrid MSB alignment
+
+   view      Transforms a hybrid MSB alignment into an alignment against the
+             original or new reference
+
+   stats     Shows information about an MSB map
+
+   liftover  Emulates UCSC liftover, using an MSB map (not a UCSC chain file)
+
+   daemon    Launches a coordinate remapping HTTP service for an MSB map
+
+   client    A simple client to query the coordinate remapping HTTP service
+
+For command help, run hybrid <command> without any parameters; i.e.:
+
+   tamtools makemap
+   tamtools hybridize
+   tamtools partial
+   tamtools view
+   tamtools stats
+   tamtools liftover
+   tamtools daemon
+   tamtools client
+
+      ''')
+    )
+    parser.add_argument('-v', '--version', action='version', version='0.0.1')
+    parser.add_argument('command', help='tamtools command to run')
+
+    # If invoked with no arguments, show help and exit:
+    if len(sys.argv[1:]) == 0:
+      parser.print_help()
+      parser.exit()
+
+    # Otherwise, parse command argument and invoke appropriate subparser:
+    args = parser.parse_args(sys.argv[1:2])
+    if not hasattr(self, args.command):
+      print 'Unrecognized tamtools command'
+      parser.print_help()
+      exit(1)
+    getattr(self, args.command)() # invoke method by command name
+
+
+  def hybridize(self):
+
+    parser = argparse.ArgumentParser(
+      formatter_class=argparse.RawDescriptionHelpFormatter,
+      description=textwrap.dedent('''\
+        tamtools hybridize converts an original alignment to a full hybrid MSB alignment:
+
+         tamtools hybridize -i ref1_aln.bam output_dir/ msb.map 1
+
+        The hybridize command can also read from stdin:
+
+         cat ref1_aln.bam | tamtools hybridize output_dir/ msb.map 1
+         tamtools hybridize output_dir/ msb.map 1 < ref1_aln.bam
+
+        This command effectively does the following:
+
+        1. Creates a partial hybrid alignment against the hybrid reference (as per
+           tamtools partial command;
+        2. Aligns any 'private' reads to the second reference assembly, then creates
+           a partial hybrid alignment for these results;
+        3. Aligns any originally unmapped reads to the second reference assembly, 
+           then creates a partial hybrid alignment for these results;
+        4. Merges the three partial hybrid alignments into a single 'full' hybrid
+           alignment.
+
+        Reads that are unmapped with respect to each of the two original reference 
+        assemblies are stored separately from the hybrid alignment. You may wish to
+        merge these unmapped reads with any results you obtain from hyram view.
+
+        The alignment steps (2 and 3 above) currently make use of the bwa aligner
+        (http://bio-bwa.sourceforge.net/). You must therefore ensure that the bwa 
+        executable is in your $PATH environment variable for this command to work.
+        Should you wish to use an alternate aligner, then you will need to use the
+        the hybrid partial command instead, and implement your own workflow for the 
+        above steps.
+      ''')
+    )
+
+    parser.add_argument('output_directory', 
+      help="path to directory where output should be stored")
+    parser.add_argument('mapping_file', 
+      help="path to msb.map produced by make_msb_map")
+    parser.add_argument('orig_ref_id', 
+      help="reference assembly ID [1|2] as per msb.map")
+    parser.add_argument('-i', dest='alignment_file', default='-', 
+      help="original alignment filename (else reads from stdin)")
+
+    # If invoked with no arguments, show help and exit:
+    if len(sys.argv) == 2:
+      parser.print_help()
+      exit(1)
+
+    # Otherwise, parse and prune arguments, and invoke hybridize logic:
+    args = parser.parse_args(sys.argv[2:]) # drop 'tamtools hybridize'
+
+    # Load MSB Map:
+    (mapping, rev_mapping, overlaps, hybridChromSizes, refsChromSizes, ref_a, ref_b, ref_hybrid) = load_mapping_file(args.mapping_file)
+    orig_ref_fasta = get_reference_assembly_fasta(
+      args.orig_ref_id, ref_a, ref_b, args.mapping_file
+    )
+
+    full_hybridization(
+      args.alignment_file, args.output_directory, 
+      orig_ref_fasta, ref_hybrid, str(args.orig_ref_id),
+      ref_a, ref_b, args.mapping_file, mapping, rev_mapping, hybridChromSizes
+    )
+
+
+  def partial(self):
+
+    parser = argparse.ArgumentParser(
+      formatter_class=argparse.RawDescriptionHelpFormatter,
+      description=textwrap.dedent('''\
+        tamtools partial converts an original alignment to a partial hybrid MSB alignment:
+
+         tamtools partial -i ref1_aln.bam -o hybrid_alignment.bam msb.map 1
+         tamtools partial -i ref1_aln.bam -o hybrid_alignment.bam -u unmap.bam msb.map 1
+
+        The partial command can also read from stdin and/or write to stdout:
+
+         cat ref1_aln.bam | tamtools partial -o hybrid_alignment.bam msb.map 1
+         cat ref1_aln.bam | tamtools partial msb.map 1 > hybrid_alignment.bam
+         tamtools partial -i ref1_aln.bam msb.map 1 > hybrid_alignment.bam
+         tamtools partial -o hybrid_alignment.bam msb.map 1 < ref1_aln.bam
+
+        This command produces a 'partial' hybrid alignment, meaning only the original 
+        mapped reads are processed, and are remapped to MSB regions or to private 
+        regions specific to the original assembly (and not the second assembly).
+
+        tamtools partial is useful should you wish to use a different aligner (i.e. not
+        bwa) to realign unmapped reads or align 'private' reads from one reference to 
+        the second reference when building a 'full' hybrid alignment.
+
+        For a 'full' hybrid alignment, it is generally simpler to instead use 
+        the tamtools hybridize command, which automates the entire process.
+      ''')
+    )
+
+    parser.add_argument('mapping_file', 
+      help="path to msb.map produced by make_msb_map")
+    parser.add_argument('orig_ref_id', 
+      help="reference assembly ID [1|2] as per msb.map")
+    parser.add_argument('-i', dest='alignment_file', default='-', 
+      help="original alignment filename (else reads from stdin)")
+    parser.add_argument('-o', dest='output_file', default='-',
+      help='hybrid alignment filename (else outputs to stdout)')
+    parser.add_argument('-u', dest='unmap_file', default=None,
+      help='unmapped reads filename (else discards unmapped reads)')
+
+    # If invoked with no arguments, show help and exit:
+    if len(sys.argv) == 2:
+      parser.print_help()
+      exit(1)
+
+    # Otherwise, parse and prune arguments, and invoke hybridize logic:
+    args = parser.parse_args(sys.argv[2:]) # drop 'tamtools hybridize'
+
+    # Load MSB Map:
+    (mapping, rev_mapping, overlaps, hybridChromSizes, refsChromSizes, ref_a, ref_b, ref_hybrid) = load_mapping_file(args.mapping_file)
+    orig_ref_fasta = get_reference_assembly_fasta(
+      args.orig_ref_id, ref_a, ref_b, args.mapping_file
+    )
+    # Remap the original "reference" alignment to a hybrid alignment:
+    samfile, filetype = samfile_details(args.alignment_file)
+    remap_sample(
+      'hybridize', 
+      samfile, filetype, args.alignment_file, args.output_file, args.unmap_file, 
+      orig_ref_fasta, ref_hybrid, str(args.orig_ref_id), 
+      args.mapping_file, mapping, hybridChromSizes, tag_new_msb_reads=False
+    )
+
+
+  def view(self):
+
+    parser = argparse.ArgumentParser(
+      formatter_class=argparse.RawDescriptionHelpFormatter,
+      description=textwrap.dedent('''\
+        tamtools view converts a hybrid alignment to a "synthetic" reference alignment:
+
+         tamtools view -i hybrid_alignment.bam -o ref1_aln.bam msb.map 1
+         tamtools view -i hybrid_alignment.bam -o ref2_aln.bam msb.map 2
+
+        The view command can also read from stdin and/or write to stdout:
+
+         cat hybrid_alignment.bam | tamtools view -o ref1_aln.bam msb.map 1
+         cat hybrid_alignment.bam | tamtools view msb.map 1 > ref1_aln.bam
+         tamtools view -i hybrid_alignment.bam msb.map 1 > ref1_aln.bam
+
+      ''')
+    )
+
+    parser.add_argument('mapping_file', 
+      help="path to msb.map produced by make_msb_map")
+    parser.add_argument('target_ref_id', 
+      help="reference assembly ID [1|2] as per msb.map")
+    parser.add_argument('-i', dest='alignment_file', default='-', 
+      help="hybrid alignment filename (else reads from stdin)")
+    parser.add_argument('-o', dest='output_file', default='-',
+      help='target alignment filename (else outputs to stdout)')
+    parser.add_argument('-r', dest='region',
+      help='target region (in contigname:start-end format)')
+    parser.add_argument('-F', action='store_true', dest='fixmates', default=False,
+      help="recalculate TLENs ('sort' and 'fixmate') [-o reqd]")
+
+    # If invoked with no arguments, show help and exit:
+    if len(sys.argv) == 2:
+      parser.print_help()
+      exit(1)
+
+    # Otherwise, parse and prune arguments, and invoke view logic:
+    args = parser.parse_args(sys.argv[2:]) # drop 'tamtools view'
+
+    # Load MSB Map:
+    (mapping, rev_mapping, overlaps, hybridChromSizes, refsChromSizes, ref_a, ref_b, ref_hybrid) = load_mapping_file(args.mapping_file)
+    target_assembly_fasta = get_reference_assembly_fasta(
+      args.target_ref_id, ref_a, ref_b, args.mapping_file
+    )
+
+    alignment_file = args.alignment_file # may be file, stdin, or a named pipe we create (for region search)
+
+    # Remap the hybrid alignment to a "synthetic" reference alignment:
+    remap_output_file = args.output_file
+
+
+    if args.fixmates:
+      if args.output_file == '-':
+        print >>sys.stderr, "If using the -F flag you must also specify the target alignment filename (-o)."
+        quit(1)
+      else:
+        remap_output_file =  args.output_file + ".unsorted"
+        sorted_output_file = args.output_file + ".sorted"
+        fixedmate_file = args.output_file
+
+    if args.region:
+      (q_contig, q_start, q_end) = get_region_details(args.region)
+      new_coords = remap_coordinates(
+        'simple_query', args.target_ref_id, mapping, q_contig, q_start, q_end, '+'
+      )
+      if new_coords is not None:
+
+        # The original region could map to more than one hybrid region (it might be a subset 
+        # of a PRIVATE_1 or PRIVATE_2 as well as a MSB region in an overlapping section):
+
+        hybrid_regions = ' '.join(map(get_region_desc, new_coords))
+
+        # We use samtools to filter the hybrid alignment by hybrid regions.
+        # Ideally we would do this using pysam.view(), but there does not seem to be
+        # a way to get the resulting output into a pysam.AlignmentFile object!
+
+        # Ensure samtools is available before using subprocess.Popen():
+        command = 'samtools --version > /dev/null'
+        return_code = subprocess.call(command, shell=True)
+        if return_code != 0:
+          print("Could not run shell command: " + command)
+          print("Exit code: " + str(return_code))
+          if return_code == 127:
+            print("Please ensure samtools is in your $PATH environment variable.")
+            print("e.g.: export PATH=/utils/samtools/bin:$PATH")
+          quit(1)
+
+        # We will use a named pipe to avoid writing to a temporary file:
+        tmpdir = tempfile.mkdtemp()
+        namedpipe_name = os.path.join(tmpdir, "regionpipe.bam")
+        os.mkfifo(namedpipe_name)
+        command = 'samtools view -b ' + args.alignment_file + ' ' + hybrid_regions + ' > ' + namedpipe_name
+        p = subprocess.Popen(command, shell=True)
+        samfile = pysam.AlignmentFile(namedpipe_name, 'rb')
+
+        # TODO: refactor remapping to allow this to work via the client/server model and 
+        #     avoid loading an msb.map for view if the user supplies a host:port instead
+        #     of the path to the msb.map.
+
+        remap_sample(
+          'view', 
+          samfile, 'bam', namedpipe_name, remap_output_file, None, # no unmapped reads file needed 
+          ref_hybrid, target_assembly_fasta, str(args.target_ref_id), 
+          args.mapping_file, rev_mapping, refsChromSizes[args.target_ref_id], tag_new_msb_reads=False
+        )
+        # tidy up
+        os.remove(os.path.join(tmpdir, "regionpipe.bam"))
+        os.rmdir(tmpdir) 
+
+      else:
+        print(
+          args.region + ' is not a valid region in target reference assembly ' + 
+          str(args.target_ref_id) + ' (' + [ref_a, ref_b][int(args.target_ref_id)-1] + ')'
+        )
+
+    else: 
+      # no region specified, so remap entire alignment file:
+      samfile, filetype = samfile_details(args.alignment_file)
+      remap_sample(
+        'view', 
+        samfile, filetype, args.alignment_file, remap_output_file, None, # no unmapped reads file needed 
+        ref_hybrid, target_assembly_fasta, str(args.target_ref_id), 
+        args.mapping_file, rev_mapping, refsChromSizes[args.target_ref_id], tag_new_msb_reads=False
+      )
+
+    # Fix TLENs if requested:
+    if args.fixmates:
+      if remap_output_file != '-':
+        pysam.sort('-n', remap_output_file, '-o', sorted_output_file)
+        pysam.fixmate(sorted_output_file, fixedmate_file)
+        # remove temp files:
+        os.remove(remap_output_file)
+        os.remove(sorted_output_file)
+
+
+  def stats(self):
+
+    parser = argparse.ArgumentParser(
+      formatter_class=argparse.RawDescriptionHelpFormatter,
+      description=textwrap.dedent('''\
+        tamtools stats shows information about an MSB map:
+
+         tamtools stats msb.map
+      ''')
+    )
+
+    parser.add_argument('mapping_file', 
+      help="path to msb.map produced by make_msb_map")
+
+    # If invoked with no arguments, show help and exit:
+    if len(sys.argv) == 2:
+      parser.print_help()
+      exit(1)
+
+    # Otherwise, parse and prune arguments, and invoke stats logic:
+    args = parser.parse_args(sys.argv[2:]) # drop 'tamtools stats'
+
+    # Load MSB Map:
+    (mapping, rev_mapping, overlaps, hybridChromSizes, refsChromSizes, ref_a, ref_b, ref_hybrid) = load_mapping_file(args.mapping_file)
+
+    # Show stats
+    show_stats(overlaps, mapping, rev_mapping, ref_a, ref_b, refsChromSizes)
+
+
+  def makemap(self):
+
+    parser = argparse.ArgumentParser(
+      formatter_class=argparse.RawDescriptionHelpFormatter,
+      description=textwrap.dedent('''\
+        tamtools makemap creates a hybrid reference assembly (in FASTA format) and 
+        the corresponding MSB map for any two reference assemblies:
+
+         tamtools makemap -o output_dir/ 1000 ref_a.fa ref_b.fa
+
+        This command currently makes use of MUMmer 3 (http://mummer.sourceforge.net/).
+        You must ensure that a 64-bit (not 32-bit) mummer executable is in your $PATH 
+        environment variable for this command to function correctly.
+      ''')
+    )
+
+    parser.add_argument('msb_blocklength', 
+      help="minimum MSB length (bp)")
+    parser.add_argument('ref_a', 
+      help="path to reference assembly A FASTA file")
+    parser.add_argument('ref_b', 
+      help="path to reference assembly B FASTA file")
+    parser.add_argument('-o', dest='output_dir', default='.',
+      help='path to output directory (default is ./)')
+
+    # If invoked with no arguments, show help and exit:
+    if len(sys.argv) == 2:
+      parser.print_help()
+      exit(1)
+
+    # Otherwise, parse and prune arguments, and invoke makemap logic:
+    args = parser.parse_args(sys.argv[2:]) # drop 'tamtools makemap'
+
+    mummer_make_map(int(args.msb_blocklength), args.ref_a, args.ref_b, args.output_dir)
+
+
+  def liftover(self):
+
+    parser = argparse.ArgumentParser(
+      formatter_class=argparse.RawDescriptionHelpFormatter,
+      description=textwrap.dedent('''\
+        tamtools liftover emulates the behaviour of the UCSC liftOver tool, but using 
+        a MSB mapping file generated with tamtools makemap instead of a UCSC chain file.
+        This allows you to translate annotations from one assembly to the other.
+        Annotations must be in BED format. Use as follows:
+
+        tamtools liftover <map_file> <ref_assembly_id> <bed_file> <new_file> <unmap_file>
+
+        For example:
+
+         tamtools liftover msb.map 2 h38snp_chr_1.bed output.bed unmapped.bed
+         tamtools liftover -t msb.map 1 h37snp_chr_1.bed output.bed unmapped.bed
+
+        The -t flag applies heuristics to translate chromosome names such as 
+        chr1, chrX, and chrM to 1, X and MT respectively.
+      ''')
+    )
+
+    parser.add_argument('mapping_file', help='MSB hybrid mapping filename')
+    parser.add_argument('ref_assembly_id', help='Reference Assembly ID (1 or 2)')
+    parser.add_argument('bed_file', help='dnSNP BED file')
+    parser.add_argument('new_file', help='new (remapped) BED file')
+    parser.add_argument('unmap_file', help='unmapped BED file')
+
+    parser.add_argument('-t', action='store_true', dest='translate_names', default=False,
+                help="remove leading 'chr' from contig names")
+
+    # If invoked with no arguments, show help and exit:
+    if len(sys.argv) == 2:
+      parser.print_help()
+      exit(1)
+
+    # Otherwise, parse and prune arguments, and invoke liftover logic:
+    args = parser.parse_args(sys.argv[2:]) # drop 'tamtools liftover'
+
+    # Load MSB Map:
+    (mapping, rev_mapping, overlaps, hybridChromSizes, refsChromSizes, ref_a, ref_b, ref_hybrid) = load_mapping_file(args.mapping_file)
+
+    lift_over(mapping, rev_mapping, args.ref_assembly_id, args.bed_file, args.new_file, args.unmap_file, args.translate_names)
+
+
+  def daemon(self):
+
+    HTTP_PORT = 2003
+
+    global quiet_flag
+
+    parser = argparse.ArgumentParser(
+      formatter_class=argparse.RawDescriptionHelpFormatter,
+      description=textwrap.dedent('''\
+        tamtools daemon launches an HTTP-based coordinate remapping service, allowing
+        translation of coordinates to or from a hybrid reference:
+
+         tamtools daemon msb.map
+         tamtools daemon -p 8000 msb.map
+         tamtools daemon -q msb.map # quiet mode - no console logging
+
+      ''') + "\nIf not suppplied, port defaults to " + str(HTTP_PORT) + 
+        '\n\nSee also: tamtools client'
+      
+    )
+    parser.add_argument('-p', type=int, dest="port", 
+      help='the port on which the HTTP service listens; defaults to ' + str(HTTP_PORT)) 
+    parser.add_argument('-q', action='store_true', dest='quiet', default=False,
+      help="quiet mode (no console logging)")
+    parser.add_argument('mapping_file', 
+      help="path to msb.map produced by tamtools makemap")
+
+    # If invoked with no arguments, show help and exit:
+    if len(sys.argv) == 2:
+      parser.print_help()
+      exit(1)
+
+    # Otherwise, parse and prune arguments, and invoke daemon logic:
+    args = parser.parse_args(sys.argv[2:]) # drop 'tamtools daemon'
+    
+    if args.port: HTTP_PORT = args.port
+
+    launch_daemon(HTTP_PORT, args.mapping_file, args.quiet)
+
+
+
+  def client(self):
+
+    parser = argparse.ArgumentParser(
+      formatter_class=argparse.RawDescriptionHelpFormatter,
+      description=textwrap.dedent('''\
+        tamtools client queries an HTTP service to remap coordinates to/from 
+        a hybrid reference:
+
+         tamtools client localhost 2003 forward 2 chr1 1524810 1524830 -
+          [ returns: ('MSB_61:178400', 72523, 72543, '-') ]
+
+         tamtools client localhost 2003 backward 2 MSB_61:178400 72523 72543 -
+          [ returns: ('chr1', 1524810, 1524830, '-') ]
+
+         tamtools client localhost 2003 backward 1 MSB_61:178400 72523 72543 -
+          [ returns: ('1', 1460190, 1460210, '-') ]
+
+        See also: tamtools daemon
+      ''')
+    )
+
+    parser.add_argument('server_host', help='remapping service host')
+    parser.add_argument('server_port', help='remapping service port')
+    parser.add_argument('direction', help='mapping direction (forward = ref->hybrid, backward = hybrid->ref)')
+    parser.add_argument('ref_assembly_id', help='reference assembly ID (1 or 2)')
+    parser.add_argument('q_contig', help='query contig name')
+    parser.add_argument('q_start', help='query start base')
+    parser.add_argument('q_end', help='query end base')
+    parser.add_argument('q_strand', help='query strand (+ or -)')
+
+    # If invoked with no arguments, show help and exit:
+    if len(sys.argv) == 2:
+      parser.print_help()
+      exit(1)
+
+    # Otherwise, parse and prune arguments, and invoke service client logic:
+    args = parser.parse_args(sys.argv[2:]) # drop 'tamtools client'
+
+    print(query_remap_server(
+      server_url(args.server_host, args.server_port), args.ref_assembly_id,
+      args.direction, args.q_contig, args.q_start, args.q_end, args.q_strand
+    ))
+
+
+if __name__ == '__main__': TAMtools()
