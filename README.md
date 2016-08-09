@@ -222,23 +222,23 @@ original assemblies. Usage is as follows:
 
 Here are some brief technical notes on the most important high level functions implemented in `tamtools`:
 
-### `mummer_make_map()`
+### mummer_make_map()
 
 Invoked by the `tamtools makemap` command, this function runs`mummer` to find maximal unique matches of length *block_length* or greater between the two original reference assemblies, and parses the output to create a conceptual mapping between such shared regions in each assembly. From this, an intermediate output file in a format very close to that of a genome coordinate mapping chain file is produced. Note that this intermediate file is not yet in exactly the right format to be a valid chain file for use with other programs such as [UCSC's liftOver](https://genome.ucsc.edu/util.html); this is intended to be implemented in future versions of TAMtools. Finally, the `create_hybrid_fasta()` function is invoked to produce the proprietary hybrid map of MSBs and implied Private Segments, along with the corresponding hybrid reference assembly in FASTA format.
 
-### `load_mapping_file()`
+### load_mapping_file()
 
 Most other high level functions use `load_mapping_file()` to load a hybrid map into memory and to generate forward and reverse mappings between both assemblies and the hybrid assembly. To avoid loading large FASTA files, the various summary data stored in the hybrid map file, such as the original assemblies' contig names and lengths, are also loaded by this function.
 
-### `remap_sample()`
+### remap_sample()
 
 `remap_sample()` iterates through the reads in an input alignment and remaps their coordinates to a different assembly. If provided with an input alignment against either of the two original assemblies, then read coordinates will be remapped to the hybrid assembly. If provided with an input alignment against hybrid assembly, then read coordinates will be remapped to the the whichever of the two original assemblies the user specifies. Originally unmapped reads will, optionally, be stored to file. Reads that are QC fail are, currently, quietly discarded. The helper functions `process_single_read()` and `process_paired_read()` are invoked as appropriate for each read; Both attempt to recreate valid SAM flags for the reads, but further work is warranted to ensure the current behaviour is correct.
 
-### `remap_coordinates()`
+### remap_coordinates()
 
 Functions that use `load_mapping_file()` will generally then use `remap_coordinates()` to convert coordinates from either of the two original assemblies to coordinates on the hybrid assembly, or vice versa. This forms the core of the `tamtools partial` command.
 
-### `full_hybridization()`
+### full_hybridization()
  
 This is an implementation of the `tamtools hybridize` workflow described above. An alignment against an original reference is remapped to the hybrid reference, and the results sorted. Two FASTQ files are created: one from any originally unmapped reads, and one from  reads that mapped to Private Segments on the hybrid assembly. Using `bwa mem`, both FASTQ files are used to create alignments against the second original reference, and these alignments are subsequently remapped to the hybrid reference. The three hybridized alignments are merged and sorted to form the final hybrid alignment. The unmappable reads for each of the original assemblies are stored independently. For debugging purposes, the current implementation uses temporary files which are deleted after the workflow is complete; it is anticipated that performance could be improved by using named pipes instead of temporary files.
 
