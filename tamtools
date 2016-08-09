@@ -17,6 +17,13 @@
 #
 #    You should have received a copy of the GNU General Public License
 #    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+#
+#    This Python program depends on the Pysam, bx-python, and tabulate 
+#    modules, and various system libraries. You may need to first:
+#
+#      pip install pysam
+#      pip install bx-python
+#      pip install tabulate
 
 import os
 import sys
@@ -1029,7 +1036,11 @@ def remap_coordinates(task, assembly_id, mapping, sample_contig_name, q_start, q
   logger.debug("SUCCESS: " + str(len(matches)))
   if len(matches) == 0:
 
-    logger.info("FATAL for: " + ' '.join([sample_contig_name, str(q_start), str(q_end), q_strand]))
+    logger.info(
+      "Read Processing Error (pair insert longer than blocklength?): " + 
+      ' '.join([sample_contig_name, str(q_start), str(q_end), q_strand])
+    )
+
     for t in targets:
 
       sample_contig_start = t.start
@@ -1154,7 +1165,7 @@ def process_paired_read(task, assembly_id, mapping, name_to_id, samfile, old, ne
       new.flag = new.flag | 0x10 
 
     new.reference_id = name_to_id[read1_maps[0][0]]  #chrom
-    new.reference_start = read1_maps[0][1] - 0 
+    new.reference_start = read1_maps[0][1]
     new.cigar = old.cigar
     
     if (old.mate_is_unmapped) or (read2_maps is None):
@@ -1226,6 +1237,7 @@ def mkdir_if_reqd(filename):
 def have_reads(list_of_sams):
 
   def contains_reads(sam_filename):
+    if not os.path.isfile(sam_filename): return(False)
     try:
       (samfile, filetype) = open_samfile(sam_filename)
       firstread = samfile.next()
@@ -1276,6 +1288,13 @@ def remap_sample(task, samfile, filetype, sam_filename, output_filename, unmap_f
       new.query_sequence = old.query_sequence
       new.query_qualities = old.query_qualities
       new.set_tags(old.get_tags())
+
+      # TODO: This is a temporary workaround for invalid RG:A:1 tag values
+      # For now, we simply set all read group tag values to 'Z'. This prevents 
+      # the resulting hybrid.bam from breaking commands like samtools view:
+
+      if old.has_tag('RG'):
+        new.set_tag('RG', 'Z')
 
       if old.is_paired:
         new = process_paired_read(task, assembly_id, mapping, name_to_id, samfile, old, new)
@@ -1564,27 +1583,29 @@ def full_hybridization(
   other_ref_fasta = get_reference_assembly_fasta(
     get_opposite_assembly_id(assembly_id), ref_a, ref_b, mapping_file
   )
-  bwa_mem(other_ref_fasta, unmap_a_fastq, unmap_a_b)
+  if os.path.getsize(unmap_a_fastq) != 0:
+    bwa_mem(other_ref_fasta, unmap_a_fastq, unmap_a_b)
+
+    # We hybridize unmap_a_b to produce:
+    # unmap_ph_a_b = unmapped reads in A that successfully align to Reference B (hybridized)
+    # unmap_unmap = unmapped reads in A that cannot align to Reference B either (refb)
+
+    samfile, filetype = samfile_details(unmap_a_b)
+    remap_sample(
+      'hybridize', 
+      samfile, filetype, unmap_a_b, unmap_ph_a_b, unmap_unmap, 
+      old_reference_fasta, new_reference_fasta, get_opposite_assembly_id(assembly_id), 
+      mapping_file, mapping, chromSizes, tag_new_msb_reads=True
+    )
 
   # Align the privately mapped reads to the other reference assembly:
   if os.path.getsize(ph_a_priv_fastq) != 0:
     bwa_mem(other_ref_fasta, ph_a_priv_fastq, ph_a_priv_b)
   
-  # We hybridize unmap_a_b to produce:
-  # unmap_ph_a_b = unmapped reads in A that successfully align to Reference B (hybridized)
-  # unmap_unmap = unmapped reads in A that cannot align to Reference B either (refb)
-  samfile, filetype = samfile_details(unmap_a_b)
-  remap_sample(
-    'hybridize', 
-    samfile, filetype, unmap_a_b, unmap_ph_a_b, unmap_unmap, 
-    old_reference_fasta, new_reference_fasta, get_opposite_assembly_id(assembly_id), 
-    mapping_file, mapping, chromSizes, tag_new_msb_reads=True
-  )
+    # We hybridize ph_a_priv_b to produce:
+    # priv_a_b = private reads in A that successfully align to Reference B (hybridized)
+    # unmap_priv_a_b = private reads in A that cannot align to Reference B (refb)
 
-  # We hybridize ph_a_priv_b to produce:
-  # priv_a_b = private reads in A that successfully align to Reference B (hybridized)
-  # unmap_priv_a_b = private reads in A that cannot align to Reference B (refb)
-  if os.path.getsize(ph_a_priv_fastq) != 0:
     samfile, filetype = samfile_details(ph_a_priv_b)
     remap_sample(
       'hybridize', 
